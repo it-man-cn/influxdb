@@ -2,6 +2,7 @@ package monitor // import "github.com/influxdata/influxdb/monitor"
 
 import (
 	"expvar"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -37,7 +38,7 @@ type Monitor struct {
 
 	mu                sync.Mutex
 	diagRegistrations map[string]diagnostics.Client
-	clusterID         string
+	clusterID         uint64
 	nodeAddr          string
 	done              chan struct{}
 	storeCreated      bool
@@ -71,7 +72,6 @@ type Monitor struct {
 // New returns a new instance of the monitor system.
 func New(c Config) *Monitor {
 	return &Monitor{
-		done:                 make(chan struct{}),
 		diagRegistrations:    make(map[string]diagnostics.Client),
 		storeEnabled:         c.StoreEnabled,
 		storeDatabase:        c.StoreDatabase,
@@ -81,11 +81,20 @@ func New(c Config) *Monitor {
 	}
 }
 
+func (m *Monitor) open() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.done == nil
+}
+
 // Open opens the monitoring system, using the given clusterID, node ID, and hostname
 // for identification purpose.
 func (m *Monitor) Open() error {
-	m.Logger.Printf("Starting monitor system")
+	if m.open() {
+		return nil
+	}
 
+	m.Logger.Printf("Starting monitor system")
 	// Self-register various stats and diagnostics.
 	m.RegisterDiagnosticsClient("build", &build{
 		Version: m.Version,
@@ -113,6 +122,10 @@ func (m *Monitor) Open() error {
 
 // Close closes the monitor system.
 func (m *Monitor) Close() error {
+	if !m.open() {
+		return nil
+	}
+
 	m.Logger.Println("shutting down monitor system")
 	m.mu.Lock()
 	close(m.done)
@@ -129,6 +142,36 @@ func (m *Monitor) Close() error {
 	m.DeregisterDiagnosticsClient("network")
 	m.DeregisterDiagnosticsClient("system")
 	return nil
+}
+
+// RemoteWriterConfig represents the configuration of a remote writer
+type RemoteWriterConfig struct {
+	RemoteAddr string
+	NodeAddr   string
+	Username   string
+	Password   string
+	ClusterID  uint64
+}
+
+func (m *Monitor) SetRemoteWriter(c RemoteWriterConfig) error {
+	if !m.storeEnabled {
+		return nil
+	}
+
+	m.Logger.Printf("Setting monitor to write remotely via %s", c.RemoteAddr)
+	clt, err := newremotePointsWriter(c.RemoteAddr, c.Username, c.Password)
+	if err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	m.nodeAddr = c.NodeAddr
+	m.clusterID = c.ClusterID
+	m.PointsWriter = clt
+	m.mu.Unlock()
+
+	// Subsequent calls to an already open Monitor are just a no-op.
+	return m.Open()
 }
 
 // SetLogOutput sets the writer to which all logs are written. It must not be
@@ -331,8 +374,8 @@ func (m *Monitor) storeStatistics() {
 	}
 
 	m.mu.Lock()
-	if m.clusterID != "" {
-		clusterTags["clusterID"] = m.clusterID
+	if m.clusterID != 0 {
+		clusterTags["clusterID"] = fmt.Sprintf("%d", m.clusterID)
 	}
 
 	if m.nodeAddr != "" {

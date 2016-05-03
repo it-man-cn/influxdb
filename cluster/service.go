@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/influxdata/influxdb/monitor"
+
 	"github.com/influxdata/influxdb"
 	"github.com/influxdata/influxdb/influxql"
 	"github.com/influxdata/influxdb/tsdb"
@@ -70,6 +72,7 @@ type Service struct {
 	Listener net.Listener
 
 	TSDBStore TSDBStore
+	Monitor   *monitor.Monitor
 
 	Logger  *log.Logger
 	statMap *expvar.Map
@@ -507,7 +510,13 @@ func (s *Service) processRemoteMonitorRequest(conn net.Conn) {
 	}
 
 	// Process the request
-	var err error
+	err := s.Monitor.SetRemoteWriter(monitor.RemoteWriterConfig{
+		RemoteAddr: req.pb.GetRemoteAddr(),
+		NodeAddr:   req.pb.GetNodeAddr(),
+		Username:   req.pb.GetUsername(),
+		Password:   req.pb.GetPassword(),
+		ClusterID:  req.pb.GetClusterID(),
+	})
 
 	// Encode response.
 	if e := EncodeTLV(conn, remoteMonitorResponseMessage, &RemoteMonitorResponse{Err: err}); e != nil {
