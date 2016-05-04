@@ -12,7 +12,7 @@ import (
 	"github.com/influxdata/influxdb/influxql"
 	"github.com/influxdata/influxdb/models"
 	"github.com/influxdata/influxdb/pkg/escape"
-	internal "github.com/influxdata/influxdb/tsdb/internal"
+	internal "github.com/it-man-cn/influxdb/tsdb/internal"
 
 	"github.com/gogo/protobuf/proto"
 )
