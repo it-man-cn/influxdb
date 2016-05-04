@@ -1,4 +1,4 @@
-package opentsdb // import "github.com/influxdata/influxdb/services/opentsdb"
+package opentsdb
 
 import (
 	"bufio"

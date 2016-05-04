@@ -1,4 +1,4 @@
-package slices // import "github.com/influxdata/influxdb/pkg/slices"
+package slices
 
 import "strings"
 

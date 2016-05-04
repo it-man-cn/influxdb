@@ -1,4 +1,4 @@
-package monitor // import "github.com/influxdata/influxdb/monitor"
+package monitor
 
 import (
 	"expvar"
