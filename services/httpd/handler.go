@@ -26,11 +26,10 @@ import (
 )
 
 const (
-	// DefaultChunkSize specifies the amount of data mappers will read
-	// up to, before sending results back to the engine. This is the
-	// default size in the number of values returned in a raw query.
+	// DefaultChunkSize specifies the maximum number of points that will
+	// be read before sending results back to the engine.
 	//
-	// Could be many more bytes depending on fields returned.
+	// This has no relation to the number of bytes that are returned.
 	DefaultChunkSize = 10000
 )
 
@@ -39,13 +38,13 @@ const (
 
 // TODO: Check HTTP response codes: 400, 401, 403, 409.
 
-type route struct {
-	name        string
-	method      string
-	pattern     string
-	gzipped     bool
-	log         bool
-	handlerFunc interface{}
+type Route struct {
+	Name           string
+	Method         string
+	Pattern        string
+	Gzipped        bool
+	LoggingEnabled bool
+	HandlerFunc    interface{}
 }
 
 // Handler represents an HTTP handler for the InfluxDB server.
@@ -55,7 +54,7 @@ type Handler struct {
 	Version               string
 
 	MetaClient interface {
-		Database(name string) (*meta.DatabaseInfo, error)
+		Database(name string) *meta.DatabaseInfo
 		Authenticate(username, password string) (ui *meta.UserInfo, err error)
 		Users() []meta.UserInfo
 	}
@@ -64,7 +63,11 @@ type Handler struct {
 		AuthorizeQuery(u *meta.UserInfo, query *influxql.Query, database string) error
 	}
 
-	QueryExecutor influxql.QueryExecutor
+	WriteAuthorizer interface {
+		AuthorizeWrite(username, database string) error
+	}
+
+	QueryExecutor *influxql.QueryExecutor
 
 	PointsWriter interface {
 		WritePoints(database, retentionPolicy string, consistencyLevel models.ConsistencyLevel, points []models.Point) error
@@ -75,88 +78,96 @@ type Handler struct {
 	Logger         *log.Logger
 	loggingEnabled bool // Log every HTTP access.
 	WriteTrace     bool // Detailed logging of write path
+	rowLimit       int
 	statMap        *expvar.Map
 }
 
 // NewHandler returns a new instance of handler with routes.
-func NewHandler(requireAuthentication, loggingEnabled, writeTrace bool, statMap *expvar.Map) *Handler {
+func NewHandler(requireAuthentication, loggingEnabled, writeTrace bool, rowLimit int, statMap *expvar.Map) *Handler {
 	h := &Handler{
 		mux: pat.New(),
 		requireAuthentication: requireAuthentication,
 		Logger:                log.New(os.Stderr, "[http] ", log.LstdFlags),
 		loggingEnabled:        loggingEnabled,
 		WriteTrace:            writeTrace,
+		rowLimit:              rowLimit,
 		statMap:               statMap,
 	}
 
-	h.SetRoutes([]route{
-		route{
-			"query", // Satisfy CORS checks.
+	h.AddRoutes([]Route{
+		Route{
+			"query-options", // Satisfy CORS checks.
 			"OPTIONS", "/query", true, true, h.serveOptions,
 		},
-		route{
+		Route{
 			"query", // Query serving route.
 			"GET", "/query", true, true, h.serveQuery,
 		},
-		route{
-			"write", // Satisfy CORS checks.
+		Route{
+			"query", // Query serving route.
+			"POST", "/query", true, true, h.serveQuery,
+		},
+		Route{
+			"write-options", // Satisfy CORS checks.
 			"OPTIONS", "/write", true, true, h.serveOptions,
 		},
-		route{
+		Route{
 			"write", // Data-ingest route.
 			"POST", "/write", true, true, h.serveWrite,
 		},
-		route{ // Ping
+		Route{ // Ping
 			"ping",
 			"GET", "/ping", true, true, h.servePing,
 		},
-		route{ // Ping
+		Route{ // Ping
 			"ping-head",
 			"HEAD", "/ping", true, true, h.servePing,
 		},
-		route{ // Ping w/ status
+		Route{ // Ping w/ status
 			"status",
 			"GET", "/status", true, true, h.serveStatus,
 		},
-		route{ // Ping w/ status
+		Route{ // Ping w/ status
 			"status-head",
 			"HEAD", "/status", true, true, h.serveStatus,
 		},
-		route{ // Tell data node to run CQs that should be run
-			"process_continuous_queries",
+		// TODO: (corylanou) remove this and associated code
+		Route{ // Tell data node to run CQs that should be run
+			"process-continuous-queries",
 			"POST", "/data/process_continuous_queries", false, false, h.serveProcessContinuousQueries,
 		},
-	})
+	}...)
 
 	return h
 }
 
 // SetRoutes sets the provided routes on the handler.
-func (h *Handler) SetRoutes(routes []route) {
+func (h *Handler) AddRoutes(routes ...Route) {
 	for _, r := range routes {
 		var handler http.Handler
 
 		// If it's a handler func that requires authorization, wrap it in authorization
-		if hf, ok := r.handlerFunc.(func(http.ResponseWriter, *http.Request, *meta.UserInfo)); ok {
+		if hf, ok := r.HandlerFunc.(func(http.ResponseWriter, *http.Request, *meta.UserInfo)); ok {
 			handler = authenticate(hf, h, h.requireAuthentication)
 		}
 		// This is a normal handler signature and does not require authorization
-		if hf, ok := r.handlerFunc.(func(http.ResponseWriter, *http.Request)); ok {
+		if hf, ok := r.HandlerFunc.(func(http.ResponseWriter, *http.Request)); ok {
 			handler = http.HandlerFunc(hf)
 		}
 
-		if r.gzipped {
+		if r.Gzipped {
 			handler = gzipFilter(handler)
 		}
 		handler = versionHeader(handler, h)
 		handler = cors(handler)
 		handler = requestID(handler)
-		if h.loggingEnabled && r.log {
-			handler = logging(handler, r.name, h.Logger)
+		if h.loggingEnabled && r.LoggingEnabled {
+			handler = h.logging(handler, r.Name)
 		}
-		handler = recovery(handler, r.name, h.Logger) // make sure recovery is always last
+		handler = h.recovery(handler, r.Name) // make sure recovery is always last
 
-		h.mux.Add(r.method, r.pattern, handler)
+		h.mux.Add(r.Method, r.Pattern, handler)
+
 	}
 }
 
@@ -236,35 +247,28 @@ func (h *Handler) serveQuery(w http.ResponseWriter, r *http.Request, user *meta.
 		h.statMap.Add(statQueryRequestDuration, time.Since(start).Nanoseconds())
 	}(time.Now())
 
-	q := r.URL.Query()
-	pretty := q.Get("pretty") == "true"
+	pretty := r.FormValue("pretty") == "true"
 
-	qp := strings.TrimSpace(q.Get("q"))
+	qp := strings.TrimSpace(r.FormValue("q"))
 	if qp == "" {
 		httpError(w, `missing required parameter "q"`, pretty, http.StatusBadRequest)
 		return
 	}
 
-	epoch := strings.TrimSpace(q.Get("epoch"))
+	epoch := strings.TrimSpace(r.FormValue("epoch"))
 
 	p := influxql.NewParser(strings.NewReader(qp))
-	db := q.Get("db")
+	db := r.FormValue("db")
+
+	// Sanitize the request query params so it doesn't show up in the response logger.
+	// Do this before anything else so a parsing error doesn't leak passwords.
+	sanitize(r)
 
 	// Parse query from query string.
 	query, err := p.ParseQuery()
 	if err != nil {
 		httpError(w, "error parsing query: "+err.Error(), pretty, http.StatusBadRequest)
 		return
-	}
-
-	// Sanitize statements with passwords.
-	for _, s := range query.Statements {
-		switch stmt := s.(type) {
-		case *influxql.CreateUserStatement:
-			sanitize(r, stmt.Password)
-		case *influxql.SetPasswordUserStatement:
-			sanitize(r, stmt.Password)
-		}
 	}
 
 	// Check authorization.
@@ -279,10 +283,10 @@ func (h *Handler) serveQuery(w http.ResponseWriter, r *http.Request, user *meta.
 	}
 
 	// Parse chunk size. Use default if not provided or unparsable.
-	chunked := (q.Get("chunked") == "true")
+	chunked := (r.FormValue("chunked") == "true")
 	chunkSize := DefaultChunkSize
 	if chunked {
-		if n, err := strconv.ParseInt(q.Get("chunk_size"), 10, 64); err == nil {
+		if n, err := strconv.ParseInt(r.FormValue("chunk_size"), 10, 64); err == nil && int(n) > 0 {
 			chunkSize = int(n)
 		}
 	}
@@ -290,16 +294,31 @@ func (h *Handler) serveQuery(w http.ResponseWriter, r *http.Request, user *meta.
 	// Make sure if the client disconnects we signal the query to abort
 	closing := make(chan struct{})
 	if notifier, ok := w.(http.CloseNotifier); ok {
+		// CloseNotify() is not guaranteed to send a notification when the query
+		// is closed. Use this channel to signal that the query is finished to
+		// prevent lingering goroutines that may be stuck.
+		done := make(chan struct{})
+		defer close(done)
+
 		notify := notifier.CloseNotify()
 		go func() {
-			<-notify
-			close(closing)
+			// Wait for either the request to finish
+			// or for the client to disconnect
+			select {
+			case <-done:
+			case <-notify:
+				close(closing)
+			}
 		}()
+	} else {
+		defer close(closing)
 	}
 
 	// Execute query.
+	w.Header().Add("Connection", "close")
 	w.Header().Add("content-type", "application/json")
-	results := h.QueryExecutor.ExecuteQuery(query, db, chunkSize, closing)
+	readonly := r.Method == "GET" || r.Method == "HEAD"
+	results := h.QueryExecutor.ExecuteQuery(query, db, chunkSize, readonly, closing)
 
 	// if we're not chunking, this will be the in memory buffer for all results before sending to client
 	resp := Response{Results: make([]*influxql.Result, 0)}
@@ -308,6 +327,7 @@ func (h *Handler) serveQuery(w http.ResponseWriter, r *http.Request, user *meta.
 	w.WriteHeader(http.StatusOK)
 
 	// pull all results from the channel
+	rows := 0
 	for r := range results {
 		// Ignore nil results.
 		if r == nil {
@@ -324,9 +344,21 @@ func (h *Handler) serveQuery(w http.ResponseWriter, r *http.Request, user *meta.
 			n, _ := w.Write(MarshalJSON(Response{
 				Results: []*influxql.Result{r},
 			}, pretty))
+			if !pretty {
+				w.Write([]byte("\n"))
+			}
 			h.statMap.Add(statQueryRequestBytesTransmitted, int64(n))
 			w.(http.Flusher).Flush()
 			continue
+		}
+
+		// Limit the number of rows that can be returned in a non-chunked response.
+		// This is to prevent the server from going OOM when returning a large response.
+		// If you want to return more than the default chunk size, then use chunking
+		// to process multiple blobs.
+		rows += len(r.Series)
+		if h.rowLimit > 0 && rows > h.rowLimit {
+			break
 		}
 
 		// It's not chunked so buffer results in memory.
@@ -337,6 +369,11 @@ func (h *Handler) serveQuery(w http.ResponseWriter, r *http.Request, user *meta.
 		if l == 0 {
 			resp.Results = append(resp.Results, r)
 		} else if resp.Results[l-1].StatementID == r.StatementID {
+			if r.Err != nil {
+				resp.Results[l-1] = r
+				continue
+			}
+
 			cr := resp.Results[l-1]
 			rowsMerged := 0
 			if len(cr.Series) > 0 {
@@ -356,6 +393,7 @@ func (h *Handler) serveQuery(w http.ResponseWriter, r *http.Request, user *meta.
 			// Append remaining rows as new rows.
 			r.Series = r.Series[rowsMerged:]
 			cr.Series = append(cr.Series, r.Series...)
+			cr.Messages = append(cr.Messages, r.Messages...)
 		} else {
 			resp.Results = append(resp.Results, r)
 		}
@@ -375,16 +413,13 @@ func (h *Handler) serveWrite(w http.ResponseWriter, r *http.Request, user *meta.
 		h.statMap.Add(statWriteRequestDuration, time.Since(start).Nanoseconds())
 	}(time.Now())
 
-	database := r.FormValue("db")
+	database := r.URL.Query().Get("db")
 	if database == "" {
 		resultError(w, influxql.Result{Err: fmt.Errorf("database is required")}, http.StatusBadRequest)
 		return
 	}
 
-	if di, err := h.MetaClient.Database(database); err != nil {
-		resultError(w, influxql.Result{Err: fmt.Errorf("metastore database error: %s", err)}, http.StatusInternalServerError)
-		return
-	} else if di == nil {
+	if di := h.MetaClient.Database(database); di == nil {
 		resultError(w, influxql.Result{Err: fmt.Errorf("database not found: %q", database)}, http.StatusNotFound)
 		return
 	}
@@ -394,9 +429,11 @@ func (h *Handler) serveWrite(w http.ResponseWriter, r *http.Request, user *meta.
 		return
 	}
 
-	if h.requireAuthentication && !user.Authorize(influxql.WritePrivilege, database) {
-		resultError(w, influxql.Result{Err: fmt.Errorf("%q user is not authorized to write to database %q", user.Name, database)}, http.StatusUnauthorized)
-		return
+	if h.requireAuthentication {
+		if err := h.WriteAuthorizer.AuthorizeWrite(user.Name, database); err != nil {
+			resultError(w, influxql.Result{Err: fmt.Errorf("%q user is not authorized to write to database %q", user.Name, database)}, http.StatusUnauthorized)
+			return
+		}
 	}
 
 	// Handle gzip decoding of the body
@@ -435,7 +472,7 @@ func (h *Handler) serveWrite(w http.ResponseWriter, r *http.Request, user *meta.
 		h.Logger.Printf("write body received by handler: %s", buf.Bytes())
 	}
 
-	points, parseError := models.ParsePointsWithPrecision(buf.Bytes(), time.Now().UTC(), r.FormValue("precision"))
+	points, parseError := models.ParsePointsWithPrecision(buf.Bytes(), time.Now().UTC(), r.URL.Query().Get("precision"))
 	// Not points parsed correctly so return the error now
 	if parseError != nil && len(points) == 0 {
 		if parseError.Error() == "EOF" {
@@ -446,8 +483,20 @@ func (h *Handler) serveWrite(w http.ResponseWriter, r *http.Request, user *meta.
 		return
 	}
 
+	// Determine required consistency level.
+	level := r.URL.Query().Get("consistency")
+	consistency := models.ConsistencyLevelOne
+	if level != "" {
+		var err error
+		consistency, err = models.ParseConsistencyLevel(level)
+		if err != nil {
+			resultError(w, influxql.Result{Err: err}, http.StatusBadRequest)
+			return
+		}
+	}
+
 	// Write points.
-	if err := h.PointsWriter.WritePoints(database, r.FormValue("rp"), models.ConsistencyLevelAny, points); influxdb.IsClientError(err) {
+	if err := h.PointsWriter.WritePoints(database, r.URL.Query().Get("rp"), consistency, points); influxdb.IsClientError(err) {
 		h.statMap.Add(statPointsWrittenFail, int64(len(points)))
 		resultError(w, influxql.Result{Err: err}, http.StatusBadRequest)
 		return
@@ -638,6 +687,10 @@ func (w gzipResponseWriter) Flush() {
 	w.Writer.(*gzip.Writer).Flush()
 }
 
+func (w gzipResponseWriter) CloseNotify() <-chan bool {
+	return w.ResponseWriter.(http.CloseNotifier).CloseNotify()
+}
+
 // determines if the client can accept compressed responses, and encodes accordingly
 func gzipFilter(inner http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -710,17 +763,17 @@ func requestID(inner http.Handler) http.Handler {
 	})
 }
 
-func logging(inner http.Handler, name string, weblog *log.Logger) http.Handler {
+func (h *Handler) logging(inner http.Handler, name string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		l := &responseLogger{w: w}
 		inner.ServeHTTP(l, r)
 		logLine := buildLogLine(l, r, start)
-		weblog.Println(logLine)
+		h.Logger.Println(logLine)
 	})
 }
 
-func recovery(inner http.Handler, name string, weblog *log.Logger) http.Handler {
+func (h *Handler) recovery(inner http.Handler, name string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		l := &responseLogger{w: w}
@@ -729,7 +782,7 @@ func recovery(inner http.Handler, name string, weblog *log.Logger) http.Handler 
 			if err := recover(); err != nil {
 				logLine := buildLogLine(l, r, start)
 				logLine = fmt.Sprintf(`%s [panic:%s]`, logLine, err)
-				weblog.Println(logLine)
+				h.Logger.Println(logLine)
 			}
 		}()
 

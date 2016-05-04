@@ -22,8 +22,6 @@ import (
 const DefaultPrecision = "s"
 
 func TestShardWriteAndIndex(t *testing.T) {
-	t.Skip("pending tsm1 iterator impl")
-
 	tmpDir, _ := ioutil.TempDir("", "shard_test")
 	defer os.RemoveAll(tmpDir)
 	tmpShard := path.Join(tmpDir, "shard")
@@ -34,6 +32,13 @@ func TestShardWriteAndIndex(t *testing.T) {
 	opts.Config.WALDir = filepath.Join(tmpDir, "wal")
 
 	sh := tsdb.NewShard(1, index, tmpShard, tmpWal, opts)
+
+	// Calling WritePoints when the engine is not open will return
+	// ErrEngineClosed.
+	if got, exp := sh.WritePoints(nil), tsdb.ErrEngineClosed; got != exp {
+		t.Fatalf("got %v, expected %v", got, exp)
+	}
+
 	if err := sh.Open(); err != nil {
 		t.Fatalf("error opening shard: %s", err.Error())
 	}
@@ -92,8 +97,6 @@ func TestShardWriteAndIndex(t *testing.T) {
 }
 
 func TestShardWriteAddNewField(t *testing.T) {
-	t.Skip("pending tsm1 iterator impl")
-
 	tmpDir, _ := ioutil.TempDir("", "shard_test")
 	defer os.RemoveAll(tmpDir)
 	tmpShard := path.Join(tmpDir, "shard")
@@ -149,9 +152,62 @@ func TestShardWriteAddNewField(t *testing.T) {
 	}
 }
 
+// Ensures that when a shard is closed, it removes any series meta-data
+// from the index.
+func TestShard_Close_RemoveIndex(t *testing.T) {
+	tmpDir, _ := ioutil.TempDir("", "shard_test")
+	defer os.RemoveAll(tmpDir)
+	tmpShard := path.Join(tmpDir, "shard")
+	tmpWal := path.Join(tmpDir, "wal")
+
+	index := tsdb.NewDatabaseIndex("db")
+	opts := tsdb.NewEngineOptions()
+	opts.Config.WALDir = filepath.Join(tmpDir, "wal")
+
+	sh := tsdb.NewShard(1, index, tmpShard, tmpWal, opts)
+
+	if err := sh.Open(); err != nil {
+		t.Fatalf("error opening shard: %s", err.Error())
+	}
+
+	pt := models.MustNewPoint(
+		"cpu",
+		map[string]string{"host": "server"},
+		map[string]interface{}{"value": 1.0},
+		time.Unix(1, 2),
+	)
+
+	err := sh.WritePoints([]models.Point{pt})
+	if err != nil {
+		t.Fatalf(err.Error())
+	}
+
+	if got, exp := index.SeriesN(), 1; got != exp {
+		t.Fatalf("series count mismatch: got %v, exp %v", got, exp)
+	}
+
+	// ensure the index gets loaded after closing and opening the shard
+	sh.Close()
+
+	if got, exp := index.SeriesN(), 0; got != exp {
+		t.Fatalf("series count mismatch: got %v, exp %v", got, exp)
+	}
+}
+
 // Ensure a shard can create iterators for its underlying data.
-func TestShard_CreateIterator(t *testing.T) {
-	sh := MustOpenShard()
+func TestShard_CreateIterator_Ascending(t *testing.T) {
+	sh := NewShard()
+
+	// Calling CreateIterator when the engine is not open will return
+	// ErrEngineClosed.
+	_, got := sh.CreateIterator(influxql.IteratorOptions{})
+	if exp := tsdb.ErrEngineClosed; got != exp {
+		t.Fatalf("got %v, expected %v", got, exp)
+	}
+
+	if err := sh.Open(); err != nil {
+		t.Fatal(err)
+	}
 	defer sh.Close()
 
 	sh.MustWritePointsString(`
@@ -177,7 +233,9 @@ cpu,host=serverB,region=uswest value=25  0
 	fitr := itr.(influxql.FloatIterator)
 
 	// Read values from iterator.
-	if p := fitr.Next(); !deep.Equal(p, &influxql.FloatPoint{
+	if p, err := fitr.Next(); err != nil {
+		t.Fatalf("unexpected error(0): %s", err)
+	} else if !deep.Equal(p, &influxql.FloatPoint{
 		Name:  "cpu",
 		Tags:  influxql.NewTags(map[string]string{"host": "serverA"}),
 		Time:  time.Unix(0, 0).UnixNano(),
@@ -187,7 +245,9 @@ cpu,host=serverB,region=uswest value=25  0
 		t.Fatalf("unexpected point(0): %s", spew.Sdump(p))
 	}
 
-	if p := fitr.Next(); !deep.Equal(p, &influxql.FloatPoint{
+	if p, err := fitr.Next(); err != nil {
+		t.Fatalf("unexpected error(1): %s", err)
+	} else if !deep.Equal(p, &influxql.FloatPoint{
 		Name:  "cpu",
 		Tags:  influxql.NewTags(map[string]string{"host": "serverA"}),
 		Time:  time.Unix(10, 0).UnixNano(),
@@ -197,14 +257,92 @@ cpu,host=serverB,region=uswest value=25  0
 		t.Fatalf("unexpected point(1): %s", spew.Sdump(p))
 	}
 
-	if p := fitr.Next(); !deep.Equal(p, &influxql.FloatPoint{
+	if p, err := fitr.Next(); err != nil {
+		t.Fatalf("unexpected error(2): %s", err)
+	} else if !deep.Equal(p, &influxql.FloatPoint{
 		Name:  "cpu",
 		Tags:  influxql.NewTags(map[string]string{"host": "serverB"}),
 		Time:  time.Unix(0, 0).UnixNano(),
 		Value: 25,
-		Aux:   []interface{}{float64(0)},
+		Aux:   []interface{}{(*float64)(nil)},
+	}) {
+		t.Fatalf("unexpected point(2): %s", spew.Sdump(p))
+	}
+}
+
+// Ensure a shard can create iterators for its underlying data.
+func TestShard_CreateIterator_Descending(t *testing.T) {
+	sh := NewShard()
+
+	// Calling CreateIterator when the engine is not open will return
+	// ErrEngineClosed.
+	_, got := sh.CreateIterator(influxql.IteratorOptions{})
+	if exp := tsdb.ErrEngineClosed; got != exp {
+		t.Fatalf("got %v, expected %v", got, exp)
+	}
+
+	if err := sh.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer sh.Close()
+
+	sh.MustWritePointsString(`
+cpu,host=serverA,region=uswest value=100 0
+cpu,host=serverA,region=uswest value=50,val2=5  10
+cpu,host=serverB,region=uswest value=25  0
+`)
+
+	// Create iterator.
+	itr, err := sh.CreateIterator(influxql.IteratorOptions{
+		Expr:       influxql.MustParseExpr(`value`),
+		Aux:        []string{"val2"},
+		Dimensions: []string{"host"},
+		Sources:    []influxql.Source{&influxql.Measurement{Name: "cpu"}},
+		Ascending:  false,
+		StartTime:  influxql.MinTime,
+		EndTime:    influxql.MaxTime,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer itr.Close()
+	fitr := itr.(influxql.FloatIterator)
+
+	// Read values from iterator.
+	if p, err := fitr.Next(); err != nil {
+		t.Fatalf("unexpected error(0): %s", err)
+	} else if !deep.Equal(p, &influxql.FloatPoint{
+		Name:  "cpu",
+		Tags:  influxql.NewTags(map[string]string{"host": "serverB"}),
+		Time:  time.Unix(0, 0).UnixNano(),
+		Value: 25,
+		Aux:   []interface{}{(*float64)(nil)},
+	}) {
+		t.Fatalf("unexpected point(0): %s", spew.Sdump(p))
+	}
+
+	if p, err := fitr.Next(); err != nil {
+		t.Fatalf("unexpected error(1): %s", err)
+	} else if !deep.Equal(p, &influxql.FloatPoint{
+		Name:  "cpu",
+		Tags:  influxql.NewTags(map[string]string{"host": "serverA"}),
+		Time:  time.Unix(10, 0).UnixNano(),
+		Value: 50,
+		Aux:   []interface{}{float64(5)},
 	}) {
 		t.Fatalf("unexpected point(1): %s", spew.Sdump(p))
+	}
+
+	if p, err := fitr.Next(); err != nil {
+		t.Fatalf("unexpected error(2): %s", err)
+	} else if !deep.Equal(p, &influxql.FloatPoint{
+		Name:  "cpu",
+		Tags:  influxql.NewTags(map[string]string{"host": "serverA"}),
+		Time:  time.Unix(0, 0).UnixNano(),
+		Value: 100,
+		Aux:   []interface{}{(*float64)(nil)},
+	}) {
+		t.Fatalf("unexpected point(2): %s", spew.Sdump(p))
 	}
 }
 

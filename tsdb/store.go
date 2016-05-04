@@ -42,6 +42,9 @@ type Store struct {
 	EngineOptions EngineOptions
 	Logger        *log.Logger
 
+	// logOutput is where output from the underlying databases will go.
+	logOutput io.Writer
+
 	closing chan struct{}
 	wg      sync.WaitGroup
 	opened  bool
@@ -57,6 +60,17 @@ func NewStore(path string) *Store {
 		path:          path,
 		EngineOptions: opts,
 		Logger:        log.New(os.Stderr, "[store] ", log.LstdFlags),
+		logOutput:     os.Stderr,
+	}
+}
+
+// SetLogOutput sets the writer to which all logs are written. It must not be
+// called after Open is called.
+func (s *Store) SetLogOutput(w io.Writer) {
+	s.Logger = log.New(w, "[store] ", log.LstdFlags)
+	s.logOutput = w
+	for _, s := range s.shards {
+		s.SetLogOutput(w)
 	}
 }
 
@@ -111,6 +125,17 @@ func (s *Store) loadIndexes() error {
 }
 
 func (s *Store) loadShards() error {
+	// struct to hold the result of opening each reader in a goroutine
+	type res struct {
+		s   *Shard
+		err error
+	}
+
+	throttle := newthrottle(4)
+
+	resC := make(chan *res)
+	var n int
+
 	// loop through the current database indexes
 	for db := range s.databaseIndexes {
 		rps, err := ioutil.ReadDir(filepath.Join(s.path, db))
@@ -130,27 +155,47 @@ func (s *Store) loadShards() error {
 				return err
 			}
 			for _, sh := range shards {
-				path := filepath.Join(s.path, db, rp.Name(), sh.Name())
-				walPath := filepath.Join(s.EngineOptions.Config.WALDir, db, rp.Name(), sh.Name())
+				n++
+				go func(index *DatabaseIndex, db, rp, sh string) {
+					throttle.take()
+					defer throttle.release()
 
-				// Shard file names are numeric shardIDs
-				shardID, err := strconv.ParseUint(sh.Name(), 10, 64)
-				if err != nil {
-					s.Logger.Printf("%s is not a valid ID. Skipping shard.", sh.Name())
-					continue
-				}
+					start := time.Now()
+					path := filepath.Join(s.path, db, rp, sh)
+					walPath := filepath.Join(s.EngineOptions.Config.WALDir, db, rp, sh)
 
-				shard := NewShard(shardID, s.databaseIndexes[db], path, walPath, s.EngineOptions)
-				err = shard.Open()
-				if err != nil {
-					return err
-				}
+					// Shard file names are numeric shardIDs
+					shardID, err := strconv.ParseUint(sh, 10, 64)
+					if err != nil {
+						resC <- &res{err: fmt.Errorf("%s is not a valid ID. Skipping shard.", sh)}
+						return
+					}
 
-				s.shards[shardID] = shard
+					shard := NewShard(shardID, s.databaseIndexes[db], path, walPath, s.EngineOptions)
+					shard.SetLogOutput(s.logOutput)
+
+					err = shard.Open()
+					if err != nil {
+						resC <- &res{err: fmt.Errorf("Failed to open shard: %d: %s", shardID, err)}
+						return
+					}
+
+					resC <- &res{s: shard}
+					s.Logger.Printf("%s opened in %s", path, time.Now().Sub(start))
+				}(s.databaseIndexes[db], db, rp.Name(), sh.Name())
 			}
 		}
 	}
 
+	for i := 0; i < n; i++ {
+		res := <-resC
+		if res.err != nil {
+			s.Logger.Println(res.err)
+			continue
+		}
+		s.shards[res.s.id] = res.s
+	}
+	close(resC)
 	return nil
 }
 
@@ -253,6 +298,7 @@ func (s *Store) CreateShard(database, retentionPolicy string, shardID uint64) er
 
 	path := filepath.Join(s.path, database, retentionPolicy, strconv.FormatUint(shardID, 10))
 	shard := NewShard(shardID, db, path, walPath, s.EngineOptions)
+	shard.SetLogOutput(s.logOutput)
 	if err := shard.Open(); err != nil {
 		return err
 	}
@@ -495,6 +541,12 @@ func (s *Store) DeleteSeries(database string, sources []influxql.Source, conditi
 	}
 	sources = a
 
+	// Determine deletion time range.
+	min, max, err := influxql.TimeRangeAsEpochNano(condition)
+	if err != nil {
+		return err
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -527,7 +579,7 @@ func (s *Store) DeleteSeries(database string, sources []influxql.Source, conditi
 			// Check for unsupported field filters.
 			// Any remaining filters means there were fields (e.g., `WHERE value = 1.2`).
 			if filters.Len() > 0 {
-				return errors.New("DROP SERIES doesn't support fields in WHERE clause")
+				return errors.New("fields not supported in WHERE clause during deletion")
 			}
 		} else {
 			// No WHERE clause so get all series IDs for this measurement.
@@ -540,18 +592,16 @@ func (s *Store) DeleteSeries(database string, sources []influxql.Source, conditi
 	}
 
 	// delete the raw series data
-	if err := s.deleteSeries(database, seriesKeys); err != nil {
+	if err := s.deleteSeries(database, seriesKeys, min, max); err != nil {
 		return err
 	}
-
-	// remove them from the index
-	db.DropSeries(seriesKeys)
 
 	return nil
 }
 
-func (s *Store) deleteSeries(database string, seriesKeys []string) error {
-	if _, ok := s.databaseIndexes[database]; !ok {
+func (s *Store) deleteSeries(database string, seriesKeys []string, min, max int64) error {
+	db := s.databaseIndexes[database]
+	if db == nil {
 		return influxql.ErrDatabaseNotFound(database)
 	}
 
@@ -559,10 +609,24 @@ func (s *Store) deleteSeries(database string, seriesKeys []string) error {
 		if sh.database != database {
 			continue
 		}
-		if err := sh.DeleteSeries(seriesKeys); err != nil {
+		if err := sh.DeleteSeriesRange(seriesKeys, min, max); err != nil {
 			return err
 		}
+
+		// The keys we passed in may be fully deleted from the shard, if so,
+		// we need to remove the shard from all the meta data indexes
+		existing, err := sh.ContainsSeries(seriesKeys)
+		if err != nil {
+			return err
+		}
+
+		for k, exists := range existing {
+			if !exists {
+				db.UnassignShard(k, sh.id)
+			}
+		}
 	}
+
 	return nil
 }
 
@@ -583,72 +647,46 @@ func (s *Store) IteratorCreators() influxql.IteratorCreators {
 	return a
 }
 
+func (s *Store) IteratorCreator(shards []uint64) (influxql.IteratorCreator, error) {
+	// Generate iterators for each node.
+	ics := make([]influxql.IteratorCreator, 0)
+	if err := func() error {
+		for _, id := range shards {
+			ic := s.ShardIteratorCreator(id)
+			if ic == nil {
+				continue
+			}
+			ics = append(ics, ic)
+		}
+
+		return nil
+	}(); err != nil {
+		influxql.IteratorCreators(ics).Close()
+		return nil, err
+	}
+
+	return influxql.IteratorCreators(ics), nil
+}
+
 // WriteToShard writes a list of points to a shard identified by its ID.
 func (s *Store) WriteToShard(shardID uint64, points []models.Point) error {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 
 	select {
 	case <-s.closing:
+		s.mu.RUnlock()
 		return ErrStoreClosed
 	default:
 	}
 
 	sh, ok := s.shards[shardID]
 	if !ok {
+		s.mu.RUnlock()
 		return ErrShardNotFound
 	}
+	s.mu.RUnlock()
 
 	return sh.WritePoints(points)
-}
-
-func (s *Store) ExecuteShowFieldKeysStatement(stmt *influxql.ShowFieldKeysStatement, database string) (models.Rows, error) {
-	// NOTE(benbjohnson):
-	// This function is temporarily moved here until reimplemented in the new query engine.
-
-	// Find the database.
-	db := s.DatabaseIndex(database)
-	if db == nil {
-		return nil, nil
-	}
-
-	// Expand regex expressions in the FROM clause.
-	sources, err := s.ExpandSources(stmt.Sources)
-	if err != nil {
-		return nil, err
-	}
-
-	measurements, err := measurementsFromSourcesOrDB(db, sources...)
-	if err != nil {
-		return nil, err
-	}
-
-	// Make result.
-	rows := make(models.Rows, 0, len(measurements))
-
-	// Loop through measurements, adding a result row for each.
-	for _, m := range measurements {
-		// Create a new row.
-		r := &models.Row{
-			Name:    m.Name,
-			Columns: []string{"fieldKey"},
-		}
-
-		// Get a list of field names from the measurement then sort them.
-		names := m.FieldNames()
-		sort.Strings(names)
-
-		// Add the field names to the result row values.
-		for _, n := range names {
-			v := interface{}(n)
-			r.Values = append(r.Values, []interface{}{v})
-		}
-
-		// Append the row to the result.
-		rows = append(rows, r)
-	}
-
-	return rows, nil
 }
 
 // filterShowSeriesResult will limit the number of series returned based on the limit and the offset.
@@ -678,87 +716,6 @@ func (e *Store) filterShowSeriesResult(limit, offset int, rows models.Rows) mode
 		}
 	}
 	return filteredSeries
-}
-
-func (s *Store) ExecuteShowTagValuesStatement(stmt *influxql.ShowTagValuesStatement, database string) (models.Rows, error) {
-	// NOTE(benbjohnson):
-	// This function is temporarily moved here until reimplemented in the new query engine.
-
-	// Check for time in WHERE clause (not supported).
-	if influxql.HasTimeExpr(stmt.Condition) {
-		return nil, errors.New("SHOW TAG VALUES doesn't support time in WHERE clause")
-	}
-
-	// Find the database.
-	db := s.DatabaseIndex(database)
-	if db == nil {
-		return nil, nil
-	}
-
-	// Expand regex expressions in the FROM clause.
-	sources, err := s.ExpandSources(stmt.Sources)
-	if err != nil {
-		return nil, err
-	}
-
-	// Get the list of measurements we're interested in.
-	measurements, err := measurementsFromSourcesOrDB(db, sources...)
-	if err != nil {
-		return nil, err
-	}
-
-	// Make result.
-	var rows models.Rows
-	tagValues := make(map[string]stringSet)
-	for _, m := range measurements {
-		var ids SeriesIDs
-
-		if stmt.Condition != nil {
-			// Get series IDs that match the WHERE clause.
-			ids, _, err = m.walkWhereForSeriesIds(stmt.Condition)
-			if err != nil {
-				return nil, err
-			}
-
-			// If no series matched, then go to the next measurement.
-			if len(ids) == 0 {
-				continue
-			}
-
-			// TODO: check return of walkWhereForSeriesIds for fields
-		} else {
-			// No WHERE clause so get all series IDs for this measurement.
-			ids = m.seriesIDs
-		}
-
-		for k, v := range m.tagValuesByKeyAndSeriesID(stmt.TagKeys, ids) {
-			_, ok := tagValues[k]
-			if !ok {
-				tagValues[k] = v
-			}
-			tagValues[k] = tagValues[k].union(v)
-		}
-	}
-
-	for k, v := range tagValues {
-		r := &models.Row{
-			Name:    k + "TagValues",
-			Columns: []string{k},
-		}
-
-		vals := v.list()
-		sort.Strings(vals)
-
-		for _, val := range vals {
-			v := interface{}(val)
-			r.Values = append(r.Values, []interface{}{v})
-		}
-
-		rows = append(rows, r)
-	}
-
-	sort.Sort(rows)
-	return rows, nil
 }
 
 // IsRetryable returns true if this error is temporary and could be retried
@@ -837,4 +794,29 @@ func measurementsFromSourcesOrDB(db *DatabaseIndex, sources ...influxql.Source) 
 	sort.Sort(measurements)
 
 	return measurements, nil
+}
+
+// throttle is a simple channel based concurrency limiter.  It uses a fixed
+// size channel to limit callers from proceeding until there is a value avalable
+// in the channel.  If all are in-use, the caller blocks until one is freed.
+type throttle struct {
+	c chan struct{}
+}
+
+func newthrottle(limit int) *throttle {
+	t := &throttle{
+		c: make(chan struct{}, limit),
+	}
+	for i := 0; i < limit; i++ {
+		t.c <- struct{}{}
+	}
+	return t
+}
+
+func (t *throttle) take() {
+	<-t.c
+}
+
+func (t *throttle) release() {
+	t.c <- struct{}{}
 }

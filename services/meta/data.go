@@ -4,13 +4,14 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gogo/protobuf/proto"
 	"github.com/influxdata/influxdb"
 	"github.com/influxdata/influxdb/influxql"
-	"github.com/influxdata/influxdb/services/meta/internal"
+	internal "github.com/influxdata/influxdb/services/meta/internal"
 )
 
 //go:generate protoc --gogo_out=. internal/meta.proto
@@ -138,26 +139,30 @@ func (data *Data) CreateRetentionPolicy(database string, rpi *RetentionPolicyInf
 		return ErrReplicationFactorTooLow
 	}
 
+	// Normalise ShardDuration before comparing to any existing
+	// retention policies
+	rpi.ShardGroupDuration = normalisedShardDuration(rpi.ShardGroupDuration, rpi.Duration)
+
 	// Find database.
 	di := data.Database(database)
 	if di == nil {
 		return influxdb.ErrDatabaseNotFound(database)
 	} else if rp := di.RetentionPolicy(rpi.Name); rp != nil {
 		// RP with that name already exists.  Make sure they're the same.
-		if rp.ReplicaN != rpi.ReplicaN || rp.Duration != rpi.Duration {
+		if rp.ReplicaN != rpi.ReplicaN || rp.Duration != rpi.Duration || rp.ShardGroupDuration != rpi.ShardGroupDuration {
 			return ErrRetentionPolicyExists
 		}
 		return nil
 	}
 
-	// Append new policy.
-	di.RetentionPolicies = append(di.RetentionPolicies, RetentionPolicyInfo{
+	// Append copy of new policy.
+	rp := RetentionPolicyInfo{
 		Name:               rpi.Name,
 		Duration:           rpi.Duration,
-		ShardGroupDuration: shardGroupDuration(rpi.Duration),
 		ReplicaN:           rpi.ReplicaN,
-	})
-
+		ShardGroupDuration: rpi.ShardGroupDuration,
+	}
+	di.RetentionPolicies = append(di.RetentionPolicies, rp)
 	return nil
 }
 
@@ -183,9 +188,10 @@ func (data *Data) DropRetentionPolicy(database, name string) error {
 
 // RetentionPolicyUpdate represents retention policy fields to be updated.
 type RetentionPolicyUpdate struct {
-	Name     *string
-	Duration *time.Duration
-	ReplicaN *int
+	Name               *string
+	Duration           *time.Duration
+	ReplicaN           *int
+	ShardGroupDuration *time.Duration
 }
 
 // SetName sets the RetentionPolicyUpdate.Name
@@ -196,6 +202,9 @@ func (rpu *RetentionPolicyUpdate) SetDuration(v time.Duration) { rpu.Duration = 
 
 // SetReplicaN sets the RetentionPolicyUpdate.ReplicaN
 func (rpu *RetentionPolicyUpdate) SetReplicaN(v int) { rpu.ReplicaN = &v }
+
+// SetShardGroupDuration sets the RetentionPolicyUpdate.ShardGroupDuration
+func (rpu *RetentionPolicyUpdate) SetShardGroupDuration(v time.Duration) { rpu.ShardGroupDuration = &v }
 
 // UpdateRetentionPolicy updates an existing retention policy.
 func (data *Data) UpdateRetentionPolicy(database, name string, rpu *RetentionPolicyUpdate) error {
@@ -227,10 +236,15 @@ func (data *Data) UpdateRetentionPolicy(database, name string, rpu *RetentionPol
 	}
 	if rpu.Duration != nil {
 		rpi.Duration = *rpu.Duration
-		rpi.ShardGroupDuration = shardGroupDuration(rpi.Duration)
 	}
 	if rpu.ReplicaN != nil {
 		rpi.ReplicaN = *rpu.ReplicaN
+	}
+
+	if rpu.ShardGroupDuration != nil {
+		rpi.ShardGroupDuration = *rpu.ShardGroupDuration
+	} else {
+		rpi.ShardGroupDuration = shardGroupDuration(rpi.Duration)
 	}
 
 	return nil
@@ -401,8 +415,14 @@ func (data *Data) CreateContinuousQuery(database, name, query string) error {
 	}
 
 	// Ensure the name doesn't already exist.
-	for i := range di.ContinuousQueries {
-		if di.ContinuousQueries[i].Name == name {
+	for _, cq := range di.ContinuousQueries {
+		if cq.Name == name {
+			// If the query string is the same, we'll silently return,
+			// otherwise we'll assume the user might be trying to
+			// overwrite an existing CQ with a different query.
+			if strings.ToLower(cq.Query) == strings.ToLower(query) {
+				return nil
+			}
 			return ErrContinuousQueryExists
 		}
 	}
@@ -527,8 +547,8 @@ func (data *Data) UpdateUser(name, hash string) error {
 	return ErrUserNotFound
 }
 
-// CloneUserInfos returns a copy of the user infos
-func (data *Data) CloneUserInfos() []UserInfo {
+// CloneUsers returns a copy of the user infos
+func (data *Data) CloneUsers() []UserInfo {
 	if len(data.Users) == 0 {
 		return []UserInfo{}
 	}
@@ -598,7 +618,7 @@ func (data *Data) Clone() *Data {
 	other := *data
 
 	other.Databases = data.CloneDatabases()
-	other.Users = data.CloneUserInfos()
+	other.Users = data.CloneUsers()
 
 	return &other
 }
@@ -935,6 +955,14 @@ func shardGroupDuration(d time.Duration) time.Duration {
 		return 1 * 24 * time.Hour
 	}
 	return 1 * time.Hour
+}
+
+// normalisedShardDuration returns normalised shard duration based on a policy duration.
+func normalisedShardDuration(sgd, d time.Duration) time.Duration {
+	if sgd == 0 {
+		return shardGroupDuration(d)
+	}
+	return sgd
 }
 
 // ShardGroupInfo represents metadata about a shard group. The DeletedAt field is important

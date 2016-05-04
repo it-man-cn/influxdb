@@ -150,11 +150,10 @@ func TestSelectStatement_SetTimeRange(t *testing.T) {
 	}
 
 	s := stmt.(*influxql.SelectStatement)
-	min, max := influxql.TimeRange(s.Condition)
 	start := time.Now().Add(-20 * time.Hour).Round(time.Second).UTC()
 	end := time.Now().Add(10 * time.Hour).Round(time.Second).UTC()
 	s.SetTimeRange(start, end)
-	min, max = influxql.TimeRange(s.Condition)
+	min, max := MustTimeRange(s.Condition)
 
 	if min != start {
 		t.Fatalf("start time wasn't set properly.\n  exp: %s\n  got: %s", start, min)
@@ -175,7 +174,7 @@ func TestSelectStatement_SetTimeRange(t *testing.T) {
 	}
 
 	s = stmt.(*influxql.SelectStatement)
-	min, max = influxql.TimeRange(s.Condition)
+	min, max = MustTimeRange(s.Condition)
 	if start != min || end != max {
 		t.Fatalf("start and end times weren't equal:\n  exp: %s\n  got: %s\n  exp: %s\n  got:%s\n", start, min, end, max)
 	}
@@ -184,7 +183,7 @@ func TestSelectStatement_SetTimeRange(t *testing.T) {
 	start = time.Now().Add(-40 * time.Hour).Round(time.Second).UTC()
 	end = time.Now().Add(20 * time.Hour).Round(time.Second).UTC()
 	s.SetTimeRange(start, end)
-	min, max = influxql.TimeRange(s.Condition)
+	min, max = MustTimeRange(s.Condition)
 
 	// TODO: right now the SetTimeRange can't override the start time if it's more recent than what they're trying to set it to.
 	//       shouldn't matter for our purposes with continuous queries, but fix this later
@@ -211,7 +210,7 @@ func TestSelectStatement_SetTimeRange(t *testing.T) {
 	start = time.Now().Add(-40 * time.Hour).Round(time.Second).UTC()
 	end = time.Now().Add(20 * time.Hour).Round(time.Second).UTC()
 	s.SetTimeRange(start, end)
-	min, max = influxql.TimeRange(s.Condition)
+	min, max = MustTimeRange(s.Condition)
 
 	if min != start {
 		t.Fatalf("start time wasn't set properly.\n  exp: %s\n  got: %s", start, min)
@@ -448,6 +447,56 @@ func TestSelectStatement_RewriteWildcards(t *testing.T) {
 	}
 }
 
+// Test SELECT statement time field rewrite.
+func TestSelectStatement_RewriteTimeFields(t *testing.T) {
+	var tests = []struct {
+		s    string
+		stmt influxql.Statement
+	}{
+		{
+			s: `SELECT time, field1 FROM cpu`,
+			stmt: &influxql.SelectStatement{
+				IsRawQuery: true,
+				Fields: []*influxql.Field{
+					{Expr: &influxql.VarRef{Val: "field1"}},
+				},
+				Sources: []influxql.Source{
+					&influxql.Measurement{Name: "cpu"},
+				},
+			},
+		},
+		{
+			s: `SELECT time AS timestamp, field1 FROM cpu`,
+			stmt: &influxql.SelectStatement{
+				IsRawQuery: true,
+				Fields: []*influxql.Field{
+					{Expr: &influxql.VarRef{Val: "field1"}},
+				},
+				Sources: []influxql.Source{
+					&influxql.Measurement{Name: "cpu"},
+				},
+				TimeAlias: "timestamp",
+			},
+		},
+	}
+
+	for i, tt := range tests {
+		// Parse statement.
+		stmt, err := influxql.NewParser(strings.NewReader(tt.s)).ParseStatement()
+		if err != nil {
+			t.Fatalf("invalid statement: %q: %s", tt.s, err)
+		}
+
+		// Rewrite statement.
+		stmt.(*influxql.SelectStatement).RewriteTimeFields()
+		if !reflect.DeepEqual(tt.stmt, stmt) {
+			t.Logf("\n# %s\nexp=%s\ngot=%s\n", tt.s, mustMarshalJSON(tt.stmt), mustMarshalJSON(stmt))
+			t.Logf("\nSQL exp=%s\nSQL got=%s\n", tt.stmt.String(), stmt.String())
+			t.Errorf("%d. %q\n\nstmt mismatch:\n\nexp=%#v\n\ngot=%#v\n\n", i, tt.s, tt.stmt, stmt)
+		}
+	}
+}
+
 // Ensure that the IsRawQuery flag gets set properly
 func TestSelectStatement_IsRawQuerySet(t *testing.T) {
 	var tests = []struct {
@@ -619,110 +668,6 @@ func TestSelectStatement_IsSimpleDerivative(t *testing.T) {
 	}
 }
 
-func TestSelectStatement_HasSimpleCount(t *testing.T) {
-	var tests = []struct {
-		stmt  string
-		count bool
-	}{
-		// No counts
-		{
-			stmt:  `SELECT value FROM cpu`,
-			count: false,
-		},
-
-		// Query count
-		{
-			stmt:  `SELECT count(value) FROM cpu`,
-			count: true,
-		},
-
-		// No GROUP BY time only
-		{
-			stmt:  `SELECT count(distinct(value)) FROM cpu where time < now() GROUP BY time(5ms)`,
-			count: false,
-		},
-
-		// Query count
-		{
-			stmt:  `SELECT typoCount(value) FROM cpu`,
-			count: false,
-		},
-
-		// No GROUP BY time only
-		{
-			stmt:  `SELECT typoCount(distinct(value)) FROM cpu where time < now() GROUP BY time(5ms)`,
-			count: false,
-		},
-	}
-
-	for i, tt := range tests {
-		// Parse statement.
-		t.Logf("index: %d, statement: %s", i, tt.stmt)
-		stmt, err := influxql.NewParser(strings.NewReader(tt.stmt)).ParseStatement()
-		if err != nil {
-			t.Fatalf("invalid statement: %q: %s", tt.stmt, err)
-		}
-
-		// Test count detection.
-		if c := stmt.(*influxql.SelectStatement).HasSimpleCount(); tt.count != c {
-			t.Errorf("%d. %q: unexpected count detection:\n\nexp=%v\n\ngot=%v\n\n", i, tt.stmt, tt.count, c)
-			continue
-		}
-	}
-}
-
-func TestSelectStatement_HasCountDistinct(t *testing.T) {
-	var tests = []struct {
-		stmt  string
-		count bool
-	}{
-		// No counts
-		{
-			stmt:  `SELECT value FROM cpu`,
-			count: false,
-		},
-
-		// Query count
-		{
-			stmt:  `SELECT count(value) FROM cpu`,
-			count: false,
-		},
-
-		// No GROUP BY time only
-		{
-			stmt:  `SELECT count(distinct(value)) FROM cpu where time < now() GROUP BY time(5ms)`,
-			count: true,
-		},
-
-		// Query count
-		{
-			stmt:  `SELECT typoCount(value) FROM cpu`,
-			count: false,
-		},
-
-		// No GROUP BY time only
-		{
-			stmt:  `SELECT typoCount(distinct(value)) FROM cpu where time < now() GROUP BY time(5ms)`,
-			count: false,
-		},
-	}
-
-	for i, tt := range tests {
-		// Parse statement.
-		t.Logf("index: %d, statement: %s", i, tt.stmt)
-		stmt, err := influxql.NewParser(strings.NewReader(tt.stmt)).ParseStatement()
-		if err != nil {
-			t.Fatalf("invalid statement: %q: %s", tt.stmt, err)
-		}
-
-		// Test count detection.
-		if c := stmt.(*influxql.SelectStatement).HasCountDistinct(); tt.count != c {
-			t.Errorf("%d. %q: unexpected count detection:\n\nexp=%v\n\ngot=%v\n\n", i, tt.stmt, tt.count, c)
-			continue
-		}
-	}
-}
-
 // Ensure binary expression names can be evaluated.
 func TestBinaryExprName(t *testing.T) {
 	for i, tt := range []struct {
@@ -749,8 +694,8 @@ func TestBinaryExprName(t *testing.T) {
 // Ensure the time range of an expression can be extracted.
 func TestTimeRange(t *testing.T) {
 	for i, tt := range []struct {
-		expr     string
-		min, max string
+		expr          string
+		min, max, err string
 	}{
 		// LHS VarRef
 		{expr: `time > '2000-01-01 00:00:00'`, min: `2000-01-01T00:00:00.000000001Z`, max: `0001-01-01T00:00:00Z`},
@@ -785,10 +730,15 @@ func TestTimeRange(t *testing.T) {
 		{expr: `time + 2`, min: `0001-01-01T00:00:00Z`, max: `0001-01-01T00:00:00Z`},
 		{expr: `time - '2000-01-01 00:00:00'`, min: `0001-01-01T00:00:00Z`, max: `0001-01-01T00:00:00Z`},
 		{expr: `time AND '2000-01-01 00:00:00'`, min: `0001-01-01T00:00:00Z`, max: `0001-01-01T00:00:00Z`},
+
+		// Invalid time expressions.
+		{expr: `time > "2000-01-01 00:00:00"`, min: `0001-01-01T00:00:00Z`, max: `0001-01-01T00:00:00Z`, err: `invalid operation: time and *influxql.VarRef are not compatible`},
+		{expr: `time > '2262-04-11 13:47:17'`, min: `0001-01-01T00:00:00Z`, max: `0001-01-01T00:00:00Z`, err: `time 2262-04-11T13:47:17Z overflows time literal`},
+		{expr: `time > '1677-09-20 19:12:43'`, min: `0001-01-01T00:00:00Z`, max: `0001-01-01T00:00:00Z`, err: `time 1677-09-20T19:12:43Z underflows time literal`},
 	} {
 		// Extract time range.
 		expr := MustParseExpr(tt.expr)
-		min, max := influxql.TimeRange(expr)
+		min, max, err := influxql.TimeRange(expr)
 
 		// Compare with expected min/max.
 		if min := min.Format(time.RFC3339Nano); tt.min != min {
@@ -798,6 +748,9 @@ func TestTimeRange(t *testing.T) {
 		if max := max.Format(time.RFC3339Nano); tt.max != max {
 			t.Errorf("%d. %s: unexpected max:\n\nexp=%s\n\ngot=%s\n\n", i, tt.expr, tt.max, max)
 			continue
+		}
+		if (err != nil && err.Error() != tt.err) || (err == nil && tt.err != "") {
+			t.Errorf("%d. %s: unexpected error:\n\nexp=%s\n\ngot=%s\n\n", i, tt.expr, tt.err, err)
 		}
 	}
 }
@@ -1013,10 +966,12 @@ func TestEval(t *testing.T) {
 		// Boolean literals.
 		{in: `true AND false`, out: false},
 		{in: `true OR false`, out: true},
+		{in: `false = 4`, out: false},
 
 		// String literals.
 		{in: `'foo' = 'bar'`, out: false},
 		{in: `'foo' = 'foo'`, out: true},
+		{in: `'' = 4`, out: false},
 
 		// Regex literals.
 		{in: `'foo' =~ /f.*/`, out: true},
@@ -1090,6 +1045,7 @@ func TestReduce(t *testing.T) {
 		{in: `now() - (now() - 60s)`, out: `1m`, data: map[string]interface{}{"now()": now}},
 		{in: `now() AND now()`, out: `'2000-01-01T00:00:00Z' AND '2000-01-01T00:00:00Z'`, data: map[string]interface{}{"now()": now}},
 		{in: `now()`, out: `now()`},
+		{in: `946684800000000000 + 2h`, out: `'2000-01-01T02:00:00Z'`},
 
 		// Duration literals.
 		{in: `10m + 1h - 60s`, out: `69m`},
@@ -1241,6 +1197,15 @@ func TestSelect_ColumnNames(t *testing.T) {
 			},
 			columns: []string{"time", "value_1", "value", "value_2"},
 		},
+		{
+			stmt: &influxql.SelectStatement{
+				Fields: influxql.Fields([]*influxql.Field{
+					{Expr: &influxql.VarRef{Val: "value"}},
+				}),
+				TimeAlias: "timestamp",
+			},
+			columns: []string{"timestamp", "value"},
+		},
 	} {
 		columns := tt.stmt.ColumnNames()
 		if !reflect.DeepEqual(columns, tt.columns) {
@@ -1299,6 +1264,15 @@ type Valuer map[string]interface{}
 func (o Valuer) Value(key string) (v interface{}, ok bool) {
 	v, ok = o[key]
 	return
+}
+
+// MustTimeRange will parse a time range. Panic on error.
+func MustTimeRange(expr influxql.Expr) (min, max time.Time) {
+	min, max, err := influxql.TimeRange(expr)
+	if err != nil {
+		panic(err)
+	}
+	return min, max
 }
 
 // mustParseTime parses an IS0-8601 string. Panic on error.

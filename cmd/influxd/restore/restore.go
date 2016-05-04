@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -170,7 +169,7 @@ func (cmd *Command) unpackMeta() error {
 
 	// Copy meta config and remove peers so it starts in single mode.
 	c := cmd.MetaConfig
-	c.LoggingEnabled = false
+	c.Dir = cmd.metadir
 
 	// Create the meta dir
 	if os.MkdirAll(c.Dir, 0700); err != nil {
@@ -183,7 +182,7 @@ func (cmd *Command) unpackMeta() error {
 	}
 
 	client := meta.NewClient(c)
-	client.SetLogger(log.New(ioutil.Discard, "", 0))
+	client.SetLogOutput(ioutil.Discard)
 	if err := client.Open(); err != nil {
 		return err
 	}
@@ -193,6 +192,25 @@ func (cmd *Command) unpackMeta() error {
 	if err := client.SetData(&data); err != nil {
 		return fmt.Errorf("set data: %s", err)
 	}
+
+	// remove the raft.db file if it exists
+	err = os.Remove(filepath.Join(cmd.metadir, "raft.db"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
+	// remove the node.json file if it exists
+	err = os.Remove(filepath.Join(cmd.metadir, "node.json"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
 	return nil
 }
 

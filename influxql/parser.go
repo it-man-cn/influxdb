@@ -63,14 +63,17 @@ func MustParseExpr(s string) Expr {
 // ParseQuery parses an InfluxQL string and returns a Query AST object.
 func (p *Parser) ParseQuery() (*Query, error) {
 	var statements Statements
-	var semi bool
+	semi := true
 
 	for {
-		if tok, _, _ := p.scanIgnoreWhitespace(); tok == EOF {
+		if tok, pos, lit := p.scanIgnoreWhitespace(); tok == EOF {
 			return &Query{Statements: statements}, nil
-		} else if !semi && tok == SEMICOLON {
+		} else if tok == SEMICOLON {
 			semi = true
 		} else {
+			if !semi {
+				return nil, newParseError(tokstr(tok, lit), []string{";"}, pos)
+			}
 			p.unscan()
 			s, err := p.ParseStatement()
 			if err != nil {
@@ -105,8 +108,10 @@ func (p *Parser) ParseStatement() (Statement, error) {
 		return p.parseAlterStatement()
 	case SET:
 		return p.parseSetPasswordUserStatement()
+	case KILL:
+		return p.parseKillQueryStatement()
 	default:
-		return nil, newParseError(tokstr(tok, lit), []string{"SELECT", "DELETE", "SHOW", "CREATE", "DROP", "GRANT", "REVOKE", "ALTER", "SET"}, pos)
+		return nil, newParseError(tokstr(tok, lit), []string{"SELECT", "DELETE", "SHOW", "CREATE", "DROP", "GRANT", "REVOKE", "ALTER", "SET", "KILL"}, pos)
 	}
 }
 
@@ -121,8 +126,6 @@ func (p *Parser) parseShowStatement() (Statement, error) {
 		return p.parseGrantsForUserStatement()
 	case DATABASES:
 		return p.parseShowDatabasesStatement()
-	case SERVERS:
-		return p.parseShowServersStatement()
 	case FIELD:
 		tok, pos, lit := p.scanIgnoreWhitespace()
 		if tok == KEYS {
@@ -131,6 +134,8 @@ func (p *Parser) parseShowStatement() (Statement, error) {
 		return nil, newParseError(tokstr(tok, lit), []string{"KEYS"}, pos)
 	case MEASUREMENTS:
 		return p.parseShowMeasurementsStatement()
+	case QUERIES:
+		return p.parseShowQueriesStatement()
 	case RETENTION:
 		tok, pos, lit := p.scanIgnoreWhitespace()
 		if tok == POLICIES {
@@ -171,9 +176,9 @@ func (p *Parser) parseShowStatement() (Statement, error) {
 		"FIELD",
 		"GRANTS",
 		"MEASUREMENTS",
+		"QUERIES",
 		"RETENTION",
 		"SERIES",
-		"SERVERS",
 		"TAG",
 		"USERS",
 		"STATS",
@@ -217,8 +222,6 @@ func (p *Parser) parseDropStatement() (Statement, error) {
 	switch tok {
 	case CONTINUOUS:
 		return p.parseDropContinuousQueryStatement()
-	case DATA, META:
-		return p.parseDropServerStatement(tok)
 	case DATABASE:
 		return p.parseDropDatabaseStatement()
 	case MEASUREMENT:
@@ -237,7 +240,7 @@ func (p *Parser) parseDropStatement() (Statement, error) {
 	case USER:
 		return p.parseDropUserStatement()
 	default:
-		return nil, newParseError(tokstr(tok, lit), []string{"CONTINUOUS", "DATA", "MEASUREMENT", "META", "RETENTION", "SERIES", "SHARD", "SUBSCRIPTION", "USER"}, pos)
+		return nil, newParseError(tokstr(tok, lit), []string{"CONTINUOUS", "MEASUREMENT", "RETENTION", "SERIES", "SHARD", "SUBSCRIPTION", "USER"}, pos)
 	}
 }
 
@@ -285,6 +288,20 @@ func (p *Parser) parseSetPasswordUserStatement() (*SetPasswordUserStatement, err
 	stmt.Password = ident
 
 	return stmt, nil
+}
+
+// parseKillQueryStatement parses a string and returns a kill statement.
+// This function assumes the KILL token has already been consumed.
+func (p *Parser) parseKillQueryStatement() (*KillQueryStatement, error) {
+	if err := p.parseTokens([]Token{QUERY}); err != nil {
+		return nil, err
+	}
+
+	qid, err := p.parseUInt64()
+	if err != nil {
+		return nil, err
+	}
+	return &KillQueryStatement{QueryID: qid}, nil
 }
 
 // parseCreateSubscriptionStatement parses a string and returns a CreatesubScriptionStatement.
@@ -367,8 +384,7 @@ func (p *Parser) parseCreateRetentionPolicyStatement() (*CreateRetentionPolicySt
 	stmt.Database = ident
 
 	// Parse required DURATION token.
-	tok, pos, lit := p.scanIgnoreWhitespace()
-	if tok != DURATION {
+	if tok, pos, lit := p.scanIgnoreWhitespace(); tok != DURATION {
 		return nil, newParseError(tokstr(tok, lit), []string{"DURATION"}, pos)
 	}
 
@@ -380,7 +396,7 @@ func (p *Parser) parseCreateRetentionPolicyStatement() (*CreateRetentionPolicySt
 	stmt.Duration = d
 
 	// Parse required REPLICATION token.
-	if tok, pos, lit = p.scanIgnoreWhitespace(); tok != REPLICATION {
+	if tok, pos, lit := p.scanIgnoreWhitespace(); tok != REPLICATION {
 		return nil, newParseError(tokstr(tok, lit), []string{"REPLICATION"}, pos)
 	}
 
@@ -391,11 +407,25 @@ func (p *Parser) parseCreateRetentionPolicyStatement() (*CreateRetentionPolicySt
 	}
 	stmt.Replication = n
 
+	// Parse optional SHARD token.
+	if tok, _, _ := p.scanIgnoreWhitespace(); tok == SHARD {
+		if tok, pos, lit := p.scanIgnoreWhitespace(); tok != DURATION {
+			return nil, newParseError(tokstr(tok, lit), []string{"DURATION"}, pos)
+		}
+		d, err := p.parseDuration()
+		if err != nil {
+			return nil, err
+		}
+		stmt.ShardGroupDuration = d
+	} else {
+		p.unscan()
+	}
+
 	// Parse optional DEFAULT token.
-	if tok, pos, lit = p.scanIgnoreWhitespace(); tok == DEFAULT {
+	if tok, _, _ := p.scanIgnoreWhitespace(); tok == DEFAULT {
 		stmt.Default = true
-	} else if tok != EOF && tok != SEMICOLON {
-		return nil, newParseError(tokstr(tok, lit), []string{"DEFAULT"}, pos)
+	} else {
+		p.unscan()
 	}
 
 	return stmt, nil
@@ -446,11 +476,22 @@ Loop:
 				return nil, err
 			}
 			stmt.Replication = &n
+		case SHARD:
+			tok, pos, lit := p.scanIgnoreWhitespace()
+			if tok == DURATION {
+				d, err := p.parseDuration()
+				if err != nil {
+					return nil, err
+				}
+				stmt.ShardGroupDuration = &d
+			} else {
+				return nil, newParseError(tokstr(tok, lit), []string{"DURATION"}, pos)
+			}
 		case DEFAULT:
 			stmt.Default = true
 		default:
 			if i < 1 {
-				return nil, newParseError(tokstr(tok, lit), []string{"DURATION", "RETENTION", "DEFAULT"}, pos)
+				return nil, newParseError(tokstr(tok, lit), []string{"DURATION", "RETENTION", "SHARD", "DEFAULT"}, pos)
 			}
 			p.unscan()
 			break Loop
@@ -952,33 +993,34 @@ func (p *Parser) parseTarget(tr targetRequirement) (*Target, error) {
 	return t, nil
 }
 
-// parseDeleteStatement parses a delete string and returns a DeleteStatement.
+// parseDeleteStatement parses a string and returns a delete statement.
 // This function assumes the DELETE token has already been consumed.
-func (p *Parser) parseDeleteStatement() (*DeleteStatement, error) {
-	// TODO remove and do not skip test once we wire up DELETE FROM.
-	// See issues https://github.com/influxdata/influxdb/issues/1647
-	// and https://github.com/influxdata/influxdb/issues/4404
-	return nil, errors.New("DELETE FROM is currently not supported. Use DROP SERIES or DROP MEASUREMENT instead")
-	//stmt := &DeleteStatement{}
+func (p *Parser) parseDeleteStatement() (Statement, error) {
+	stmt := &DeleteSeriesStatement{}
+	var err error
 
-	//// Parse source
-	//if tok, pos, lit := p.scanIgnoreWhitespace(); tok != FROM {
-	//	return nil, newParseError(tokstr(tok, lit), []string{"FROM"}, pos)
-	//}
-	//source, err := p.parseSource()
-	//if err != nil {
-	//	return nil, err
-	//}
-	//stmt.Source = source
+	tok, pos, lit := p.scanIgnoreWhitespace()
 
-	//// Parse condition: "WHERE EXPR".
-	//condition, err := p.parseCondition()
-	//if err != nil {
-	//	return nil, err
-	//}
-	//stmt.Condition = condition
+	if tok == FROM {
+		// Parse source.
+		if stmt.Sources, err = p.parseSources(); err != nil {
+			return nil, err
+		}
+	} else {
+		p.unscan()
+	}
 
-	//return stmt, nil
+	// Parse condition: "WHERE EXPR".
+	if stmt.Condition, err = p.parseCondition(); err != nil {
+		return nil, err
+	}
+
+	// If they didn't provide a FROM or a WHERE, this query is invalid
+	if stmt.Condition == nil && stmt.Sources == nil {
+		return nil, newParseError(tokstr(tok, lit), []string{"FROM", "WHERE"}, pos)
+	}
+
+	return stmt, nil
 }
 
 // parseShowSeriesStatement parses a string and returns a ShowSeriesStatement.
@@ -1069,6 +1111,12 @@ func (p *Parser) parseShowMeasurementsStatement() (*ShowMeasurementsStatement, e
 	}
 
 	return stmt, nil
+}
+
+// parseShowQueriesStatement parses a string and returns a ShowQueriesStatement.
+// This function assumes the "SHOW QUERIES" tokens have been consumed.
+func (p *Parser) parseShowQueriesStatement() (*ShowQueriesStatement, error) {
+	return &ShowQueriesStatement{}, nil
 }
 
 // parseShowRetentionPoliciesStatement parses a string and returns a ShowRetentionPoliciesStatement.
@@ -1328,29 +1376,6 @@ func (p *Parser) parseDropShardStatement() (*DropShardStatement, error) {
 	return stmt, nil
 }
 
-// parseDropServerStatement parses a string and returns a DropServerStatement.
-// This function assumes the "DROP <META|DATA>" tokens have already been consumed.
-func (p *Parser) parseDropServerStatement(tok Token) (*DropServerStatement, error) {
-	// Parse the SERVER token
-	if tok, pos, lit := p.scanIgnoreWhitespace(); tok != SERVER {
-		return nil, newParseError(tokstr(tok, lit), []string{"SERVER"}, pos)
-	}
-
-	s := &DropServerStatement{}
-	var err error
-
-	if tok == META {
-		s.Meta = true
-	}
-
-	// Parse the server's ID.
-	if s.NodeID, err = p.parseUInt64(); err != nil {
-		return nil, err
-	}
-
-	return s, nil
-}
-
 // parseShowContinuousQueriesStatement parses a string and returns a ShowContinuousQueriesStatement.
 // This function assumes the "SHOW CONTINUOUS" tokens have already been consumed.
 func (p *Parser) parseShowContinuousQueriesStatement() (*ShowContinuousQueriesStatement, error) {
@@ -1361,13 +1386,6 @@ func (p *Parser) parseShowContinuousQueriesStatement() (*ShowContinuousQueriesSt
 		return nil, newParseError(tokstr(tok, lit), []string{"QUERIES"}, pos)
 	}
 
-	return stmt, nil
-}
-
-// parseShowServersStatement parses a string and returns a ShowServersStatement.
-// This function assumes the "SHOW SERVERS" tokens have already been consumed.
-func (p *Parser) parseShowServersStatement() (*ShowServersStatement, error) {
-	stmt := &ShowServersStatement{}
 	return stmt, nil
 }
 
@@ -1497,10 +1515,10 @@ func (p *Parser) parseCreateDatabaseStatement() (*CreateDatabaseStatement, error
 
 	// Look for "WITH"
 	if tok, _, _ := p.scanIgnoreWhitespace(); tok == WITH {
-		// validate that at least one of DURATION, REPLICATION or NAME is provided
+		// validate that at least one of DURATION, NAME, REPLICATION or SHARD is provided
 		tok, pos, lit := p.scanIgnoreWhitespace()
-		if tok != DURATION && tok != REPLICATION && tok != NAME {
-			return nil, newParseError(tokstr(tok, lit), []string{"DURATION", "REPLICATION", "NAME"}, pos)
+		if tok != DURATION && tok != NAME && tok != REPLICATION && tok != SHARD {
+			return nil, newParseError(tokstr(tok, lit), []string{"DURATION", "NAME", "REPLICATION", "SHARD"}, pos)
 		}
 		// rewind
 		p.unscan()
@@ -1532,6 +1550,23 @@ func (p *Parser) parseCreateDatabaseStatement() (*CreateDatabaseStatement, error
 		}
 		stmt.RetentionPolicyReplication = rpReplication
 
+		// Look for "SHARD"
+		var rpShardGroupDuration time.Duration
+		if err := p.parseTokens([]Token{SHARD}); err != nil {
+			p.unscan()
+		} else {
+			// Look for "DURATION"
+			tok, pos, lit := p.scanIgnoreWhitespace()
+			if tok != DURATION {
+				return nil, newParseError(tokstr(tok, lit), []string{"DURATION"}, pos)
+			}
+			rpShardGroupDuration, err = p.parseDuration()
+			if err != nil {
+				return nil, err
+			}
+			stmt.RetentionPolicyShardGroupDuration = rpShardGroupDuration
+		}
+
 		// Look for "NAME"
 		var rpName string = "default" // default is default
 		if err := p.parseTokens([]Token{NAME}); err != nil {
@@ -1546,7 +1581,6 @@ func (p *Parser) parseCreateDatabaseStatement() (*CreateDatabaseStatement, error
 	} else {
 		p.unscan()
 	}
-
 	return stmt, nil
 }
 

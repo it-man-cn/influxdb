@@ -3,7 +3,9 @@ package tsm1
 import (
 	"expvar"
 	"fmt"
+	"io"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -26,13 +28,14 @@ type TSMFile interface {
 
 	// ReadAt returns all the values in the block identified by entry.
 	ReadAt(entry *IndexEntry, values []Value) ([]Value, error)
-	ReadFloatBlockAt(entry *IndexEntry, values []FloatValue) ([]FloatValue, error)
-	ReadIntegerBlockAt(entry *IndexEntry, values []IntegerValue) ([]IntegerValue, error)
-	ReadStringBlockAt(entry *IndexEntry, values []StringValue) ([]StringValue, error)
-	ReadBooleanBlockAt(entry *IndexEntry, values []BooleanValue) ([]BooleanValue, error)
+	ReadFloatBlockAt(entry *IndexEntry, tdec *TimeDecoder, vdec *FloatDecoder, values *[]FloatValue) ([]FloatValue, error)
+	ReadIntegerBlockAt(entry *IndexEntry, tdec *TimeDecoder, vdec *IntegerDecoder, values *[]IntegerValue) ([]IntegerValue, error)
+	ReadStringBlockAt(entry *IndexEntry, tdec *TimeDecoder, vdec *StringDecoder, values *[]StringValue) ([]StringValue, error)
+	ReadBooleanBlockAt(entry *IndexEntry, tdec *TimeDecoder, vdec *BooleanDecoder, values *[]BooleanValue) ([]BooleanValue, error)
 
 	// Entries returns the index entries for all blocks for the given key.
-	Entries(key string) []*IndexEntry
+	Entries(key string) []IndexEntry
+	ReadEntries(key string, entries *[]IndexEntry)
 
 	// Returns true if the TSMFile may contain a value with the specified
 	// key and time
@@ -45,11 +48,17 @@ type TSMFile interface {
 	// TimeRange returns the min and max time across all keys in the file.
 	TimeRange() (int64, int64)
 
+	// TombstoneRange returns ranges of time that are deleted for the given key.
+	TombstoneRange(key string) []TimeRange
+
 	// KeyRange returns the min and max keys in the file.
 	KeyRange() (string, string)
 
-	// Keys returns all keys contained in the file.
-	Keys() []string
+	// KeyCount returns the number of distict keys in the file.
+	KeyCount() int
+
+	// KeyAt returns the key located at index position idx
+	KeyAt(idx int) (string, byte)
 
 	// Type returns the block type of the values stored for the key.  Returns one of
 	// BlockFloat64, BlockInt64, BlockBoolean, BlockString.  If key does not exist,
@@ -58,6 +67,9 @@ type TSMFile interface {
 
 	// Delete removes the keys from the set of keys available in this file.
 	Delete(keys []string) error
+
+	// DeleteRange removes the values for keys between min and max.
+	DeleteRange(keys []string, min, max int64) error
 
 	// HasTombstones returns true if file contains values that have been deleted.
 	HasTombstones() bool
@@ -138,6 +150,12 @@ func NewFileStore(dir string) *FileStore {
 	}
 }
 
+// SetLogOutput sets the logger used for all messages. It must not be called
+// after the Open method has been called.
+func (f *FileStore) SetLogOutput(w io.Writer) {
+	f.Logger = log.New(w, "[filestore] ", log.LstdFlags)
+}
+
 // Returns the number of TSM files currently loaded
 func (f *FileStore) Count() int {
 	f.mu.RLock()
@@ -203,23 +221,37 @@ func (f *FileStore) Remove(paths ...string) {
 	sort.Sort(tsmReaders(f.files))
 }
 
-func (f *FileStore) Keys() []string {
+// WalkKeys calls fn for every key in every TSM file known to the FileStore.  If the key
+// exists in multiple files, it will be invoked for each file.
+func (f *FileStore) WalkKeys(fn func(key string, typ byte) error) error {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 
-	uniqueKeys := map[string]struct{}{}
 	for _, f := range f.files {
-		for _, key := range f.Keys() {
-			uniqueKeys[key] = struct{}{}
+		for i := 0; i < f.KeyCount(); i++ {
+			key, typ := f.KeyAt(i)
+			if err := fn(key, typ); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// Keys returns all keys and types for all files
+func (f *FileStore) Keys() map[string]byte {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	uniqueKeys := map[string]byte{}
+	for _, f := range f.files {
+		for i := 0; i < f.KeyCount(); i++ {
+			key, typ := f.KeyAt(i)
+			uniqueKeys[key] = typ
 		}
 	}
 
-	var keys []string
-	for key := range uniqueKeys {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	return keys
+	return uniqueKeys
 }
 
 func (f *FileStore) Type(key string) (byte, error) {
@@ -235,13 +267,18 @@ func (f *FileStore) Type(key string) (byte, error) {
 }
 
 func (f *FileStore) Delete(keys []string) error {
+	return f.DeleteRange(keys, math.MinInt64, math.MaxInt64)
+}
+
+// DeleteRange removes the values for keys between min and max.
+func (f *FileStore) DeleteRange(keys []string, min, max int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	f.lastModified = time.Now()
 
 	for _, file := range f.files {
-		if err := file.Delete(keys); err != nil {
+		if err := file.DeleteRange(keys, min, max); err != nil {
 			return err
 		}
 	}
@@ -292,9 +329,7 @@ func (f *FileStore) Open() error {
 
 		go func(idx int, file *os.File) {
 			start := time.Now()
-			df, err := NewTSMReaderWithOptions(TSMReaderOptions{
-				MMAPFile: file,
-			})
+			df, err := NewTSMReader(file)
 			if f.traceLogging {
 				f.Logger.Printf("%s (#%d) opened in %v", file.Name(), idx, time.Now().Sub(start))
 			}
@@ -404,9 +439,7 @@ func (f *FileStore) Replace(oldFiles, newFiles []string) error {
 			return err
 		}
 
-		tsm, err := NewTSMReaderWithOptions(TSMReaderOptions{
-			MMAPFile: fd,
-		})
+		tsm, err := NewTSMReader(fd)
 		if err != nil {
 			return err
 		}
@@ -434,6 +467,10 @@ func (f *FileStore) Replace(oldFiles, newFiles []string) error {
 		if keep {
 			active = append(active, file)
 		}
+	}
+
+	if err := syncDir(f.dir); err != nil {
+		return err
 	}
 
 	f.files = active
@@ -480,7 +517,7 @@ func (f *FileStore) BlockCount(path string, idx int) int {
 					return 0
 				}
 			}
-			_, _, _, block, _ := iter.Read()
+			_, _, _, _, block, _ := iter.Read()
 			return BlockCount(block)
 		}
 	}
@@ -489,19 +526,20 @@ func (f *FileStore) BlockCount(path string, idx int) int {
 
 // locations returns the files and index blocks for a key and time.  ascending indicates
 // whether the key will be scan in ascending time order or descenging time order.
-func (f *FileStore) locations(key string, t int64, ascending bool) []*location {
-	var locations []*location
+// This function assumes the read-lock has been taken.
+func (f *FileStore) locations(key string, t int64, ascending bool) []location {
+	var locations []location
 
-	f.mu.RLock()
 	filesSnapshot := make([]TSMFile, len(f.files))
 	for i := range f.files {
 		filesSnapshot[i] = f.files[i]
 	}
-	f.mu.RUnlock()
 
+	var entries []IndexEntry
 	for _, fd := range filesSnapshot {
 		minTime, maxTime := fd.TimeRange()
 
+		tombstones := fd.TombstoneRange(key)
 		// If we ascending and the max time of the file is before where we want to start
 		// skip it.
 		if ascending && maxTime < t {
@@ -514,7 +552,21 @@ func (f *FileStore) locations(key string, t int64, ascending bool) []*location {
 
 		// This file could potential contain points we are looking for so find the blocks for
 		// the given key.
-		for _, ie := range fd.Entries(key) {
+		fd.ReadEntries(key, &entries)
+		for _, ie := range entries {
+
+			// Skip any blocks only contain values that are tombstoned.
+			var skip bool
+			for _, t := range tombstones {
+				if t.Min <= ie.MinTime && t.Max >= ie.MaxTime {
+					skip = true
+					break
+				}
+			}
+
+			if skip {
+				continue
+			}
 			// If we ascending and the max time of a block is before where we are looking, skip
 			// it since the data is out of our range
 			if ascending && ie.MaxTime < t {
@@ -526,7 +578,7 @@ func (f *FileStore) locations(key string, t int64, ascending bool) []*location {
 			}
 
 			// Otherwise, add this file and block location
-			locations = append(locations, &location{
+			locations = append(locations, location{
 				r:     fd,
 				entry: ie,
 			})
@@ -561,12 +613,12 @@ type KeyCursor struct {
 	fs  *FileStore
 
 	// seeks is all the file locations that we need to return during iteration.
-	seeks []*location
+	seeks []location
 
 	// current is the set of blocks possibly containing the next set of points.
 	// Normally this is just one entry, but there may be multiple if points have
 	// been overwritten.
-	current []*location
+	current []location
 	buf     []Value
 
 	// pos is the index within seeks.  Based on ascending, it will increment or
@@ -583,13 +635,14 @@ type KeyCursor struct {
 
 type location struct {
 	r     TSMFile
-	entry *IndexEntry
+	entry IndexEntry
 
 	// Has this location been read before
 	read bool
 }
 
 // newKeyCursor returns a new instance of KeyCursor.
+// This function assumes the read-lock has been taken.
 func newKeyCursor(fs *FileStore, key string, t int64, ascending bool) *KeyCursor {
 	c := &KeyCursor{
 		key:       key,
@@ -701,7 +754,12 @@ func (c *KeyCursor) nextAscending() {
 	}
 
 	// Append the first matching block
-	c.current = []*location{c.seeks[c.pos]}
+	if len(c.current) == 0 {
+		c.current = append(c.current, location{})
+	} else {
+		c.current = c.current[:1]
+	}
+	c.current[0] = c.seeks[c.pos]
 
 	// We're done if there are no overlapping blocks.
 	if !c.duplicates {
@@ -732,7 +790,12 @@ func (c *KeyCursor) nextDescending() {
 	}
 
 	// Append the first matching block
-	c.current = []*location{c.seeks[c.pos]}
+	if len(c.current) == 0 {
+		c.current = make([]location, 1)
+	} else {
+		c.current = c.current[:1]
+	}
+	c.current[0] = c.seeks[c.pos]
 
 	// We're done if there are no overlapping blocks.
 	if !c.duplicates {
@@ -752,43 +815,51 @@ func (c *KeyCursor) nextDescending() {
 }
 
 // ReadFloatBlock reads the next block as a set of float values.
-func (c *KeyCursor) ReadFloatBlock(buf []FloatValue) ([]FloatValue, error) {
+func (c *KeyCursor) ReadFloatBlock(tdec *TimeDecoder, fdec *FloatDecoder, buf *[]FloatValue) ([]FloatValue, error) {
 	// No matching blocks to decode
 	if len(c.current) == 0 {
 		return nil, nil
 	}
 
 	// First block is the oldest block containing the points we're search for.
-	first := c.current[0]
-	values, err := first.r.ReadFloatBlockAt(first.entry, buf[:0])
+	first := &c.current[0]
+	*buf = (*buf)[:0]
+	values, err := first.r.ReadFloatBlockAt(&first.entry, tdec, fdec, buf)
 	first.read = true
+
+	tombstones := first.r.TombstoneRange(c.key)
 
 	// Only one block with this key and time range so return it
 	if len(c.current) == 1 {
-		return values, err
+		return c.filterFloatValues(tombstones, values), err
 	}
 
 	// Otherwise, search the remaining blocks that overlap and append their values so we can
 	// dedup them.
 	for i := 1; i < len(c.current); i++ {
 		cur := c.current[i]
+		tombstones := cur.r.TombstoneRange(c.key)
+
 		if c.ascending && !cur.read {
 			cur.read = true
 			c.pos++
-			v, err := cur.r.ReadFloatBlockAt(cur.entry, nil)
+
+			var a []FloatValue
+			v, err := cur.r.ReadFloatBlockAt(&cur.entry, tdec, fdec, &a)
 			if err != nil {
 				return nil, err
 			}
-			values = append(values, v...)
+			values = append(values, c.filterFloatValues(tombstones, v)...)
 		} else if !c.ascending && !cur.read {
 			cur.read = true
 			c.pos--
 
-			v, err := cur.r.ReadFloatBlockAt(cur.entry, nil)
+			var a []FloatValue
+			v, err := cur.r.ReadFloatBlockAt(&cur.entry, tdec, fdec, &a)
 			if err != nil {
 				return nil, err
 			}
-			values = append(v, values...)
+			values = append(c.filterFloatValues(tombstones, v), values...)
 		}
 	}
 
@@ -796,43 +867,51 @@ func (c *KeyCursor) ReadFloatBlock(buf []FloatValue) ([]FloatValue, error) {
 }
 
 // ReadIntegerBlock reads the next block as a set of integer values.
-func (c *KeyCursor) ReadIntegerBlock(buf []IntegerValue) ([]IntegerValue, error) {
+func (c *KeyCursor) ReadIntegerBlock(tdec *TimeDecoder, vdec *IntegerDecoder, buf *[]IntegerValue) ([]IntegerValue, error) {
 	// No matching blocks to decode
 	if len(c.current) == 0 {
 		return nil, nil
 	}
 
 	// First block is the oldest block containing the points we're search for.
-	first := c.current[0]
-	values, err := first.r.ReadIntegerBlockAt(first.entry, buf[:0])
+	first := &c.current[0]
+	*buf = (*buf)[:0]
+	values, err := first.r.ReadIntegerBlockAt(&first.entry, tdec, vdec, buf)
 	first.read = true
+
+	tombstones := first.r.TombstoneRange(c.key)
 
 	// Only one block with this key and time range so return it
 	if len(c.current) == 1 {
-		return values, err
+		return c.filterIntegerValues(tombstones, values), err
 	}
 
 	// Otherwise, search the remaining blocks that overlap and append their values so we can
 	// dedup them.
 	for i := 1; i < len(c.current); i++ {
 		cur := c.current[i]
+		tombstones = cur.r.TombstoneRange(c.key)
+
 		if c.ascending && !cur.read {
 			cur.read = true
 			c.pos++
-			v, err := cur.r.ReadIntegerBlockAt(cur.entry, nil)
+
+			var a []IntegerValue
+			v, err := cur.r.ReadIntegerBlockAt(&cur.entry, tdec, vdec, &a)
 			if err != nil {
 				return nil, err
 			}
-			values = append(values, v...)
+			values = append(values, c.filterIntegerValues(tombstones, v)...)
 		} else if !c.ascending && !cur.read {
 			cur.read = true
 			c.pos--
 
-			v, err := cur.r.ReadIntegerBlockAt(cur.entry, nil)
+			var a []IntegerValue
+			v, err := cur.r.ReadIntegerBlockAt(&cur.entry, tdec, vdec, &a)
 			if err != nil {
 				return nil, err
 			}
-			values = append(v, values...)
+			values = append(c.filterIntegerValues(tombstones, v), values...)
 		}
 	}
 
@@ -840,43 +919,49 @@ func (c *KeyCursor) ReadIntegerBlock(buf []IntegerValue) ([]IntegerValue, error)
 }
 
 // ReadStringBlock reads the next block as a set of string values.
-func (c *KeyCursor) ReadStringBlock(buf []StringValue) ([]StringValue, error) {
+func (c *KeyCursor) ReadStringBlock(tdec *TimeDecoder, vdec *StringDecoder, buf *[]StringValue) ([]StringValue, error) {
 	// No matching blocks to decode
 	if len(c.current) == 0 {
 		return nil, nil
 	}
 
 	// First block is the oldest block containing the points we're search for.
-	first := c.current[0]
-	values, err := first.r.ReadStringBlockAt(first.entry, buf[:0])
+	first := &c.current[0]
+	*buf = (*buf)[:0]
+	values, err := first.r.ReadStringBlockAt(&first.entry, tdec, vdec, buf)
 	first.read = true
+
+	tombstones := first.r.TombstoneRange(c.key)
 
 	// Only one block with this key and time range so return it
 	if len(c.current) == 1 {
-		return values, err
+		return c.filterStringValues(tombstones, values), err
 	}
 
 	// Otherwise, search the remaining blocks that overlap and append their values so we can
 	// dedup them.
 	for i := 1; i < len(c.current); i++ {
 		cur := c.current[i]
+		tombstones = cur.r.TombstoneRange(c.key)
 		if c.ascending && !cur.read {
 			cur.read = true
 			c.pos++
-			v, err := cur.r.ReadStringBlockAt(cur.entry, nil)
+			var a []StringValue
+			v, err := cur.r.ReadStringBlockAt(&cur.entry, tdec, vdec, &a)
 			if err != nil {
 				return nil, err
 			}
-			values = append(values, v...)
+			values = append(values, c.filterStringValues(tombstones, v)...)
 		} else if !c.ascending && !cur.read {
 			cur.read = true
 			c.pos--
 
-			v, err := cur.r.ReadStringBlockAt(cur.entry, nil)
+			var a []StringValue
+			v, err := cur.r.ReadStringBlockAt(&cur.entry, tdec, vdec, &a)
 			if err != nil {
 				return nil, err
 			}
-			values = append(v, values...)
+			values = append(c.filterStringValues(tombstones, v), values...)
 		}
 	}
 
@@ -884,47 +969,82 @@ func (c *KeyCursor) ReadStringBlock(buf []StringValue) ([]StringValue, error) {
 }
 
 // ReadBooleanBlock reads the next block as a set of boolean values.
-func (c *KeyCursor) ReadBooleanBlock(buf []BooleanValue) ([]BooleanValue, error) {
+func (c *KeyCursor) ReadBooleanBlock(tdec *TimeDecoder, vdec *BooleanDecoder, buf *[]BooleanValue) ([]BooleanValue, error) {
 	// No matching blocks to decode
 	if len(c.current) == 0 {
 		return nil, nil
 	}
 
 	// First block is the oldest block containing the points we're search for.
-	first := c.current[0]
-	values, err := first.r.ReadBooleanBlockAt(first.entry, buf[:0])
+	first := &c.current[0]
+	*buf = (*buf)[:0]
+	values, err := first.r.ReadBooleanBlockAt(&first.entry, tdec, vdec, buf)
 	first.read = true
+
+	tombstones := first.r.TombstoneRange(c.key)
 
 	// Only one block with this key and time range so return it
 	if len(c.current) == 1 {
-		return values, err
+		return c.filterBooleanValues(tombstones, values), err
 	}
 
 	// Otherwise, search the remaining blocks that overlap and append their values so we can
 	// dedup them.
 	for i := 1; i < len(c.current); i++ {
 		cur := c.current[i]
+		tombstones = cur.r.TombstoneRange(c.key)
 		if c.ascending && !cur.read {
 			cur.read = true
 			c.pos++
-			v, err := cur.r.ReadBooleanBlockAt(cur.entry, nil)
+
+			var a []BooleanValue
+			v, err := cur.r.ReadBooleanBlockAt(&cur.entry, tdec, vdec, &a)
 			if err != nil {
 				return nil, err
 			}
-			values = append(values, v...)
+			values = append(values, c.filterBooleanValues(tombstones, v)...)
 		} else if !c.ascending && !cur.read {
 			cur.read = true
 			c.pos--
 
-			v, err := cur.r.ReadBooleanBlockAt(cur.entry, nil)
+			var a []BooleanValue
+			v, err := cur.r.ReadBooleanBlockAt(&cur.entry, tdec, vdec, &a)
 			if err != nil {
 				return nil, err
 			}
-			values = append(v, values...)
+			values = append(c.filterBooleanValues(tombstones, v), values...)
 		}
 	}
 
 	return BooleanValues(values).Deduplicate(), err
+}
+
+func (c *KeyCursor) filterFloatValues(tombstones []TimeRange, values FloatValues) FloatValues {
+	for _, t := range tombstones {
+		values = values.Filter(t.Min, t.Max)
+	}
+	return values
+}
+
+func (c *KeyCursor) filterIntegerValues(tombstones []TimeRange, values IntegerValues) IntegerValues {
+	for _, t := range tombstones {
+		values = values.Filter(t.Min, t.Max)
+	}
+	return values
+}
+
+func (c *KeyCursor) filterStringValues(tombstones []TimeRange, values StringValues) StringValues {
+	for _, t := range tombstones {
+		values = values.Filter(t.Min, t.Max)
+	}
+	return values
+}
+
+func (c *KeyCursor) filterBooleanValues(tombstones []TimeRange, values BooleanValues) BooleanValues {
+	for _, t := range tombstones {
+		values = values.Filter(t.Min, t.Max)
+	}
+	return values
 }
 
 type tsmReaders []TSMFile

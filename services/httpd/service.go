@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"expvar"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -64,6 +65,7 @@ func NewService(c Config) *Service {
 			c.AuthEnabled,
 			c.LogEnabled,
 			c.WriteTracing,
+			c.MaxRowLimit,
 			statMap,
 		),
 		Logger: log.New(os.Stderr, "[httpd] ", log.LstdFlags),
@@ -129,9 +131,12 @@ func (s *Service) Close() error {
 	return nil
 }
 
-// SetLogger sets the internal logger to the logger passed in.
-func (s *Service) SetLogger(l *log.Logger) {
+// SetLogOutput sets the writer to which all logs are written. It must not be
+// called after Open is called.
+func (s *Service) SetLogOutput(w io.Writer) {
+	l := log.New(w, "[httpd] ", log.LstdFlags)
 	s.Logger = l
+	s.Handler.Logger = l
 }
 
 // Err returns a channel for fatal errors that occur on the listener.

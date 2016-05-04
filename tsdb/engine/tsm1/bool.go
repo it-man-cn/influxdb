@@ -17,12 +17,7 @@ const (
 )
 
 // BooleanEncoder encodes a series of booleans to an in-memory buffer.
-type BooleanEncoder interface {
-	Write(b bool)
-	Bytes() ([]byte, error)
-}
-
-type booleanEncoder struct {
+type BooleanEncoder struct {
 	// The encoded bytes
 	bytes []byte
 
@@ -38,10 +33,10 @@ type booleanEncoder struct {
 
 // NewBooleanEncoder returns a new instance of BooleanEncoder.
 func NewBooleanEncoder() BooleanEncoder {
-	return &booleanEncoder{}
+	return BooleanEncoder{}
 }
 
-func (e *booleanEncoder) Write(b bool) {
+func (e *BooleanEncoder) Write(b bool) {
 	// If we have filled the current byte, flush it
 	if e.i >= 8 {
 		e.flush()
@@ -60,7 +55,7 @@ func (e *booleanEncoder) Write(b bool) {
 	e.n++
 }
 
-func (e *booleanEncoder) flush() {
+func (e *BooleanEncoder) flush() {
 	// Pad remaining byte w/ 0s
 	for e.i < 8 {
 		e.b = e.b << 1
@@ -75,7 +70,7 @@ func (e *booleanEncoder) flush() {
 	}
 }
 
-func (e *booleanEncoder) Bytes() ([]byte, error) {
+func (e *BooleanEncoder) Bytes() ([]byte, error) {
 	// Ensure the current byte is flushed
 	e.flush()
 	b := make([]byte, 10+1)
@@ -92,34 +87,32 @@ func (e *booleanEncoder) Bytes() ([]byte, error) {
 }
 
 // BooleanDecoder decodes a series of booleans from an in-memory buffer.
-type BooleanDecoder interface {
-	Next() bool
-	Read() bool
-	Error() error
-}
-
-type booleanDecoder struct {
+type BooleanDecoder struct {
 	b   []byte
 	i   int
 	n   int
 	err error
 }
 
-// NewBooleanDecoder returns a new instance of BooleanDecoder.
-func NewBooleanDecoder(b []byte) BooleanDecoder {
+// SetBytes initializes the decoder with a new set of bytes to read from.
+// This must be called before calling any other methods.
+func (e *BooleanDecoder) SetBytes(b []byte) {
 	// First byte stores the encoding type, only have 1 bit-packet format
 	// currently ignore for now.
 	b = b[1:]
 	count, n := binary.Uvarint(b)
-	return &booleanDecoder{b: b[n:], i: -1, n: int(count)}
+
+	e.b = b[n:]
+	e.i = -1
+	e.n = int(count)
 }
 
-func (e *booleanDecoder) Next() bool {
+func (e *BooleanDecoder) Next() bool {
 	e.i++
 	return e.i < e.n
 }
 
-func (e *booleanDecoder) Read() bool {
+func (e *BooleanDecoder) Read() bool {
 	// Index into the byte slice
 	idx := e.i / 8
 
@@ -136,6 +129,6 @@ func (e *booleanDecoder) Read() bool {
 	return v&mask == mask
 }
 
-func (e *booleanDecoder) Error() error {
+func (e *BooleanDecoder) Error() error {
 	return e.err
 }

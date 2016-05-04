@@ -69,7 +69,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
-	"math"
+	"os"
 	"sort"
 	"sync"
 	"time"
@@ -93,11 +93,15 @@ const (
 
 	// Max number of blocks for a given key that can exist in a single file
 	maxIndexEntries = (1 << (indexCountSize * 8)) - 1
+
+	// max length of a key in an index entry (measurement + tags)
+	maxKeyLength = (1 << (2 * 8)) - 1
 )
 
 var (
-	ErrNoValues  = fmt.Errorf("no values written")
-	ErrTSMClosed = fmt.Errorf("tsm file closed")
+	ErrNoValues             = fmt.Errorf("no values written")
+	ErrTSMClosed            = fmt.Errorf("tsm file closed")
+	ErrMaxKeyLengthExceeded = fmt.Errorf("max key length exceeded")
 )
 
 // TSMWriter writes TSM formatted key and values.
@@ -128,39 +132,16 @@ type TSMWriter interface {
 	Size() uint32
 }
 
-// TSMIndex represent the index section of a TSM file.  The index records all
-// blocks, their locations, sizes, min and max times.
-type TSMIndex interface {
-
+// IndexWriter writes a TSMIndex
+type IndexWriter interface {
 	// Add records a new block entry for a key in the index.
 	Add(key string, blockType byte, minTime, maxTime int64, offset int64, size uint32)
 
-	// Delete removes the given keys from the index.
-	Delete(keys []string)
-
-	// Contains return true if the given key exists in the index.
-	Contains(key string) bool
-
-	// ContainsValue returns true if key and time might exists in this file.  This function could
-	// return true even though the actual point does not exists.  For example, the key may
-	// exists in this file, but not have point exactly at time t.
-	ContainsValue(key string, timestamp int64) bool
-
 	// Entries returns all index entries for a key.
-	Entries(key string) []*IndexEntry
-
-	// Entry returns the index entry for the specified key and timestamp.  If no entry
-	// matches the key and timestamp, nil is returned.
-	Entry(key string, timestamp int64) *IndexEntry
+	Entries(key string) []IndexEntry
 
 	// Keys returns the unique set of keys in the index.
 	Keys() []string
-
-	// Key returns the key in the index at the given postion.
-	Key(index int) (string, []*IndexEntry)
-
-	// KeyAt returns the key in the index at the given postion.
-	KeyAt(index int) string
 
 	// KeyCount returns the count of unique keys in the index.
 	KeyCount() int
@@ -168,26 +149,11 @@ type TSMIndex interface {
 	// Size returns the size of a the current index in bytes
 	Size() uint32
 
-	// TimeRange returns the min and max time across all keys in the file.
-	TimeRange() (int64, int64)
-
-	// KeyRange returns the min and max keys in the file.
-	KeyRange() (string, string)
-
-	// Type returns the block type of the values stored for the key.  Returns one of
-	// BlockFloat64, BlockInt64, BlockBool, BlockString.  If key does not exist,
-	// an error is returned.
-	Type(key string) (byte, error)
-
 	// MarshalBinary returns a byte slice encoded version of the index.
 	MarshalBinary() ([]byte, error)
 
-	// UnmarshalBinary populates an index from an encoded byte slice
-	// representation of an index.
-	UnmarshalBinary(b []byte) error
-
-	// Write writes the index contents to a writer
-	Write(w io.Writer) error
+	// WriteTo writes the index contents to a writer
+	WriteTo(w io.Writer) error
 }
 
 // IndexEntry is the index information for a given block in a TSM file.
@@ -249,7 +215,7 @@ func (e *IndexEntry) String() string {
 		time.Unix(0, e.MinTime).UTC(), time.Unix(0, e.MaxTime).UTC(), e.Offset, e.Size)
 }
 
-func NewDirectIndex() TSMIndex {
+func NewIndexWriter() IndexWriter {
 	return &directIndex{
 		blocks: map[string]*indexEntries{},
 	}
@@ -279,7 +245,7 @@ func (d *directIndex) Add(key string, blockType byte, minTime, maxTime int64, of
 		// size of the count of entries stored in the index
 		d.size += indexCountSize
 	}
-	entries.Append(&IndexEntry{
+	entries.entries = append(entries.entries, IndexEntry{
 		MinTime: minTime,
 		MaxTime: maxTime,
 		Offset:  offset,
@@ -290,7 +256,7 @@ func (d *directIndex) Add(key string, blockType byte, minTime, maxTime int64, of
 	d.size += indexEntrySize
 }
 
-func (d *directIndex) Entries(key string) []*IndexEntry {
+func (d *directIndex) Entries(key string) []IndexEntry {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
@@ -308,37 +274,10 @@ func (d *directIndex) Entry(key string, t int64) *IndexEntry {
 	entries := d.Entries(key)
 	for _, entry := range entries {
 		if entry.Contains(t) {
-			return entry
+			return &entry
 		}
 	}
 	return nil
-}
-
-func (d *directIndex) Type(key string) (byte, error) {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	entries := d.blocks[key]
-	if entries != nil {
-		return entries.Type, nil
-	}
-	return 0, fmt.Errorf("key does not exist: %v", key)
-}
-
-func (d *directIndex) Contains(key string) bool {
-	return len(d.Entries(key)) > 0
-}
-
-func (d *directIndex) ContainsValue(key string, t int64) bool {
-	return d.Entry(key, t) != nil
-}
-
-func (d *directIndex) Delete(keys []string) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	for _, k := range keys {
-		delete(d.blocks, k)
-	}
 }
 
 func (d *directIndex) Keys() []string {
@@ -353,52 +292,8 @@ func (d *directIndex) Keys() []string {
 	return keys
 }
 
-func (d *directIndex) Key(idx int) (string, []*IndexEntry) {
-	if idx < 0 || idx >= len(d.blocks) {
-		return "", nil
-	}
-	k := d.Keys()[idx]
-	return k, d.blocks[k].entries
-}
-
-func (d *directIndex) KeyAt(idx int) string {
-	if idx < 0 || idx >= len(d.blocks) {
-		return ""
-	}
-	return d.Keys()[idx]
-}
-
 func (d *directIndex) KeyCount() int {
 	return len(d.blocks)
-}
-
-func (d *directIndex) KeyRange() (string, string) {
-	var min, max string
-	for k := range d.blocks {
-		if min == "" || k < min {
-			min = k
-		}
-		if max == "" || k > max {
-			max = k
-		}
-
-	}
-	return min, max
-}
-
-func (d *directIndex) TimeRange() (int64, int64) {
-	min, max := int64(math.MaxInt64), int64(math.MinInt64)
-	for _, entries := range d.blocks {
-		for _, e := range entries.entries {
-			if e.MinTime < min {
-				min = e.MinTime
-			}
-			if e.MaxTime > max {
-				max = e.MaxTime
-			}
-		}
-	}
-	return min, max
 }
 
 func (d *directIndex) addEntries(key string, entries *indexEntries) {
@@ -407,10 +302,10 @@ func (d *directIndex) addEntries(key string, entries *indexEntries) {
 		d.blocks[key] = entries
 		return
 	}
-	existing.Append(entries.entries...)
+	existing.entries = append(existing.entries, entries.entries...)
 }
 
-func (d *directIndex) Write(w io.Writer) error {
+func (d *directIndex) WriteTo(w io.Writer) error {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
@@ -462,7 +357,7 @@ func (d *directIndex) Write(w io.Writer) error {
 
 func (d *directIndex) MarshalBinary() ([]byte, error) {
 	var b bytes.Buffer
-	if err := d.Write(&b); err != nil {
+	if err := d.WriteTo(&b); err != nil {
 		return nil, err
 	}
 	return b.Bytes(), nil
@@ -482,13 +377,14 @@ func (d *directIndex) UnmarshalBinary(b []byte) error {
 		}
 		pos += n
 
-		n, entries, err := readEntries(b[pos:])
+		var entries indexEntries
+		n, err = readEntries(b[pos:], &entries)
 		if err != nil {
 			return fmt.Errorf("readIndex: read entries error: %v", err)
 		}
 
 		pos += n
-		d.addEntries(string(key), entries)
+		d.addEntries(string(key), &entries)
 	}
 	return nil
 }
@@ -501,7 +397,7 @@ func (d *directIndex) Size() uint32 {
 type tsmWriter struct {
 	wrapped io.Writer
 	w       *bufio.Writer
-	index   TSMIndex
+	index   IndexWriter
 	n       int64
 }
 
@@ -530,6 +426,10 @@ func (t *tsmWriter) Write(key string, values Values) error {
 	// Nothing to write
 	if len(values) == 0 {
 		return nil
+	}
+
+	if len(key) > maxKeyLength {
+		return ErrMaxKeyLengthExceeded
 	}
 
 	// Write header only after we have some data to write.
@@ -622,7 +522,7 @@ func (t *tsmWriter) WriteIndex() error {
 	}
 
 	// Write the index
-	if err := t.index.Write(t.w); err != nil {
+	if err := t.index.WriteTo(t.w); err != nil {
 		return err
 	}
 
@@ -637,6 +537,12 @@ func (t *tsmWriter) WriteIndex() error {
 func (t *tsmWriter) Close() error {
 	if err := t.w.Flush(); err != nil {
 		return err
+	}
+
+	if f, ok := t.wrapped.(*os.File); ok {
+		if err := f.Sync(); err != nil {
+			return err
+		}
 	}
 
 	if c, ok := t.wrapped.(io.Closer); ok {

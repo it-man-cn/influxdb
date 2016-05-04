@@ -90,6 +90,7 @@ func NewClient(config *Config) *Client {
 func (c *Client) Open() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	// Try to load from disk
 	if err := c.Load(); err != nil {
 		return err
@@ -150,31 +151,31 @@ func (c *Client) ClusterID() uint64 {
 }
 
 // Database returns info for the requested database.
-func (c *Client) Database(name string) (*DatabaseInfo, error) {
+func (c *Client) Database(name string) *DatabaseInfo {
 	c.mu.RLock()
 	data := c.cacheData.Clone()
 	c.mu.RUnlock()
 
 	for _, d := range data.Databases {
 		if d.Name == name {
-			return &d, nil
+			return &d
 		}
 	}
 
-	return nil, influxdb.ErrDatabaseNotFound(name)
+	return nil
 }
 
 // Databases returns a list of all database infos.
-func (c *Client) Databases() ([]DatabaseInfo, error) {
+func (c *Client) Databases() []DatabaseInfo {
 	c.mu.RLock()
 	data := c.cacheData.Clone()
 	c.mu.RUnlock()
 
 	dbs := data.Databases
 	if dbs == nil {
-		return []DatabaseInfo{}, nil
+		return []DatabaseInfo{}
 	}
-	return dbs, nil
+	return dbs
 }
 
 // CreateDatabase creates a database or returns it if it already exists
@@ -229,7 +230,9 @@ func (c *Client) CreateDatabaseWithRetentionPolicy(name string, rpi *RetentionPo
 		// Check if the retention policy already exists. If it does and matches
 		// the desired retention policy, exit with no error.
 		if rp := db.RetentionPolicy(rpi.Name); rp != nil {
-			if rp.ReplicaN != rpi.ReplicaN || rp.Duration != rpi.Duration {
+			// Normalise ShardDuration before comparing to any existing retention policies.
+			rpi.ShardGroupDuration = normalisedShardDuration(rpi.ShardGroupDuration, rpi.Duration)
+			if rp.ReplicaN != rpi.ReplicaN || rp.Duration != rpi.Duration || rp.ShardGroupDuration != rpi.ShardGroupDuration {
 				return nil, ErrRetentionPolicyConflict
 			}
 			return db, nil
@@ -281,10 +284,6 @@ func (c *Client) CreateRetentionPolicy(database string, rpi *RetentionPolicyInfo
 	defer c.mu.Unlock()
 
 	data := c.cacheData.Clone()
-
-	if rp, _ := data.RetentionPolicy(database, rpi.Name); rp != nil {
-		return rp, nil
-	}
 
 	if rpi.Duration < MinRetentionPolicyDuration && rpi.Duration != 0 {
 		return nil, ErrRetentionPolicyDurationTooLow
@@ -700,6 +699,10 @@ func (c *Client) CreateShardGroup(database, policy string, timestamp time.Time) 
 
 	data := c.cacheData.Clone()
 
+	if sg, _ := data.ShardGroupByTimestamp(database, policy, timestamp); sg != nil {
+		return sg, nil
+	}
+
 	sgi, err := createShardGroup(data, database, policy, timestamp)
 	if err != nil {
 		return nil, err
@@ -713,8 +716,9 @@ func (c *Client) CreateShardGroup(database, policy string, timestamp time.Time) 
 }
 
 func createShardGroup(data *Data, database, policy string, timestamp time.Time) (*ShardGroupInfo, error) {
+	// It is the responsibility of the caller to check if it exists before calling this method.
 	if sg, _ := data.ShardGroupByTimestamp(database, policy, timestamp); sg != nil {
-		return sg, nil
+		return nil, ErrShardGroupExists
 	}
 
 	if err := data.CreateShardGroup(database, policy, timestamp); err != nil {
@@ -758,6 +762,7 @@ func (c *Client) PrecreateShardGroups(from, to time.Time) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	data := c.cacheData.Clone()
+	var changed bool
 
 	for _, di := range data.Databases {
 		for _, rp := range di.RetentionPolicies {
@@ -773,17 +778,26 @@ func (c *Client) PrecreateShardGroups(from, to time.Time) error {
 
 				// Create successive shard group.
 				nextShardGroupTime := g.EndTime.Add(1 * time.Nanosecond)
-				if newGroup, err := createShardGroup(data, di.Name, rp.Name, nextShardGroupTime); err != nil {
-					c.logger.Printf("failed to precreate successive shard group for group %d: %s", g.ID, err.Error())
-				} else {
-					c.logger.Printf("new shard group %d successfully precreated for database %s, retention policy %s", newGroup.ID, di.Name, rp.Name)
+				// if it already exists, continue
+				if sg, _ := data.ShardGroupByTimestamp(di.Name, rp.Name, nextShardGroupTime); sg != nil {
+					c.logger.Printf("shard group %d exists for database %s, retention policy %s", sg.ID, di.Name, rp.Name)
+					continue
 				}
+				newGroup, err := createShardGroup(data, di.Name, rp.Name, nextShardGroupTime)
+				if err != nil {
+					c.logger.Printf("failed to precreate successive shard group for group %d: %s", g.ID, err.Error())
+					continue
+				}
+				changed = true
+				c.logger.Printf("new shard group %d successfully precreated for database %s, retention policy %s", newGroup.ID, di.Name, rp.Name)
 			}
 		}
 	}
 
-	if err := c.commit(data); err != nil {
-		return err
+	if changed {
+		if err := c.commit(data); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -903,6 +917,13 @@ func (c *Client) SetData(data *Data) error {
 	return nil
 }
 
+func (c *Client) Data() Data {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	d := c.cacheData.Clone()
+	return *d
+}
+
 // WaitForDataChanged will return a channel that will get closed when
 // the metastore data has changed
 func (c *Client) WaitForDataChanged() chan struct{} {
@@ -936,10 +957,12 @@ func (c *Client) MarshalBinary() ([]byte, error) {
 	return c.cacheData.MarshalBinary()
 }
 
-func (c *Client) SetLogger(l *log.Logger) {
+// SetLogOutput sets the writer to which all logs are written. It must not be
+// called after Open is called.
+func (c *Client) SetLogOutput(w io.Writer) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.logger = l
+	c.logger = log.New(w, "[metaclient] ", log.LstdFlags)
 }
 
 func (c *Client) updateAuthCache() {
@@ -979,7 +1002,12 @@ func snapshot(path string, data *Data) error {
 		return err
 	}
 
-	if err = f.Close(); nil != err {
+	if err = f.Sync(); err != nil {
+		return err
+	}
+
+	//close file handle before renaming to support Windows
+	if err = f.Close(); err != nil {
 		return err
 	}
 

@@ -11,7 +11,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"os/user"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -56,6 +55,7 @@ type CommandLine struct {
 	PPS              int // Controls how many points per second the import will allow via throttling
 	Path             string
 	Compressed       bool
+	Chunked          bool
 	Quit             chan struct{}
 	IgnoreSignals    bool // Ignore signals normally caught by this process (used primarily for testing)
 	osSignals        chan os.Signal
@@ -73,9 +73,9 @@ func New(version string) *CommandLine {
 
 // Run executes the CLI
 func (c *CommandLine) Run() error {
-	// register OS signals for graceful termination
 	if !c.IgnoreSignals {
-		signal.Notify(c.osSignals, os.Kill, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGHUP)
+		// register OS signals for graceful termination
+		signal.Notify(c.osSignals, syscall.SIGINT, syscall.SIGTERM)
 	}
 
 	var promptForPassword bool
@@ -167,10 +167,10 @@ func (c *CommandLine) Run() error {
 
 	c.Version()
 
-	usr, err := user.Current()
-	// Only load/write history if we can get the user
-	if err == nil {
-		c.historyFilePath = filepath.Join(usr.HomeDir, ".influx_history")
+	// Only load/write history if HOME environment variable is set.
+	if homeDir := os.Getenv("HOME"); homeDir != "" {
+		// Attempt to load the history file.
+		c.historyFilePath = filepath.Join(homeDir, ".influx_history")
 		if historyFile, err := os.Open(c.historyFilePath); err == nil {
 			c.Line.ReadHistory(historyFile)
 			historyFile.Close()
@@ -178,10 +178,16 @@ func (c *CommandLine) Run() error {
 	}
 
 	// read from prompt until exit is run
+	return c.mainLoop()
+}
+
+// mainLoop runs the main prompt loop for the CLI.
+func (c *CommandLine) mainLoop() error {
 	for {
 		select {
 		case <-c.osSignals:
-			close(c.Quit)
+			c.exit()
+			return nil
 		case <-c.Quit:
 			c.exit()
 			return nil
@@ -191,7 +197,8 @@ func (c *CommandLine) Run() error {
 				// Instead of die, register that someone exited the program gracefully
 				l = "exit"
 			} else if e != nil {
-				break
+				c.exit()
+				return e
 			}
 			if err := c.ParseCommand(l); err != ErrBlankCommand {
 				c.Line.AppendHistory(l)
@@ -209,7 +216,6 @@ func (c *CommandLine) ParseCommand(cmd string) error {
 	if len(tokens) > 0 {
 		switch tokens[0] {
 		case "exit", "quit":
-			// signal the program to exit
 			close(c.Quit)
 		case "gopher":
 			c.gopher()
@@ -518,9 +524,18 @@ func (c *CommandLine) Insert(stmt string) error {
 	return nil
 }
 
+// query creates a query struct to be used with the client.
+func (c *CommandLine) query(query string, database string) client.Query {
+	return client.Query{
+		Command:  query,
+		Database: database,
+		Chunked:  true,
+	}
+}
+
 // ExecuteQuery runs any query statement
 func (c *CommandLine) ExecuteQuery(query string) error {
-	response, err := c.Client.Query(client.Query{Command: query, Database: c.Database})
+	response, err := c.Client.Query(c.query(query, c.Database))
 	if err != nil {
 		fmt.Printf("ERR: %s\n", err)
 		return err
@@ -539,7 +554,7 @@ func (c *CommandLine) ExecuteQuery(query string) error {
 
 // DatabaseToken retrieves database token
 func (c *CommandLine) DatabaseToken() (string, error) {
-	response, err := c.Client.Query(client.Query{Command: "SHOW DIAGNOSTICS for 'registration'"})
+	response, err := c.Client.Query(c.query("SHOW DIAGNOSTICS for 'registration'", ""))
 	if err != nil {
 		return "", err
 	}
@@ -598,15 +613,20 @@ func (c *CommandLine) writeCSV(response *client.Response, w io.Writer) {
 }
 
 func (c *CommandLine) writeColumns(response *client.Response, w io.Writer) {
+	// Create a tabbed writer for each result as they won't always line up
+	writer := new(tabwriter.Writer)
+	writer.Init(w, 0, 8, 1, '\t', 0)
+
 	for _, result := range response.Results {
-		// Create a tabbed writer for each result a they won't always line up
-		w := new(tabwriter.Writer)
-		w.Init(os.Stdout, 0, 8, 1, '\t', 0)
+		// Print out all messages first
+		for _, m := range result.Messages {
+			fmt.Fprintf(w, "%s: %s.\n", m.Level, m.Text)
+		}
 		csv := c.formatResults(result, "\t")
 		for _, r := range csv {
-			fmt.Fprintln(w, r)
+			fmt.Fprintln(writer, r)
 		}
-		w.Flush()
+		writer.Flush()
 	}
 }
 
@@ -748,7 +768,7 @@ func (c *CommandLine) help() {
         show field keys       show field key information
 
         A full list of influxql commands can be found at:
-        https://docs.influxdata.com/influxdb/v0.10/query_language/spec
+        https://docs.influxdata.com/influxdb/latest/query_language/spec/
 `)
 }
 
@@ -826,7 +846,7 @@ func (c *CommandLine) gopher() {
 
 // Version prints CLI version
 func (c *CommandLine) Version() {
-	fmt.Println("InfluxDB shell " + c.ClientVersion)
+	fmt.Println("InfluxDB shell version:", c.ClientVersion)
 }
 
 func (c *CommandLine) exit() {

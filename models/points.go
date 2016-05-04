@@ -27,8 +27,13 @@ var (
 		'=': []byte(`\=`),
 	}
 
-	ErrPointMustHaveAField = errors.New("point without fields is unsupported")
-	ErrInvalidNumber       = errors.New("invalid number")
+	ErrPointMustHaveAField  = errors.New("point without fields is unsupported")
+	ErrInvalidNumber        = errors.New("invalid number")
+	ErrMaxKeyLengthExceeded = errors.New("max key length exceeded")
+)
+
+const (
+	MaxKeyLength = 65535
 )
 
 // Point defines the values that will be written to the database
@@ -134,9 +139,17 @@ func ParsePointsString(buf string) ([]Point, error) {
 
 // ParseKey returns the measurement name and tags from a point.
 func ParseKey(buf string) (string, Tags, error) {
-	_, keyBuf, err := scanKey([]byte(buf), 0)
-	tags := parseTags([]byte(buf))
-	return string(keyBuf), tags, err
+	// Ignore the error because scanMeasurement returns "missing fields" which we ignore
+	// when just parsing a key
+	state, i, _ := scanMeasurement([]byte(buf), 0)
+
+	var tags Tags
+	if state == tagKeyState {
+		tags = parseTags([]byte(buf))
+		// scanMeasurement returns the location of the comma if there are tags, strip that off
+		return string(buf[:i-1]), tags, nil
+	}
+	return string(buf[:i]), tags, nil
 }
 
 // ParsePointsWithPrecision is similar to ParsePoints, but allows the
@@ -202,6 +215,10 @@ func parsePoint(buf []byte, defaultTime time.Time, precision string) (Point, err
 	// measurement name is required
 	if len(key) == 0 {
 		return nil, fmt.Errorf("missing measurement")
+	}
+
+	if len(key) > MaxKeyLength {
+		return nil, fmt.Errorf("max key length exceeded: %v > %v", len(key), MaxKeyLength)
 	}
 
 	// scan the second block is which is field1=value1[,field2=value2,...]
@@ -1004,7 +1021,7 @@ func unescapeMeasurement(in []byte) []byte {
 
 func escapeTag(in []byte) []byte {
 	for b, esc := range tagEscapeCodes {
-		if bytes.Contains(in, []byte{b}) {
+		if bytes.IndexByte(in, b) != -1 {
 			in = bytes.Replace(in, []byte{b}, esc, -1)
 		}
 	}
@@ -1013,7 +1030,7 @@ func escapeTag(in []byte) []byte {
 
 func unescapeTag(in []byte) []byte {
 	for b, esc := range tagEscapeCodes {
-		if bytes.Contains(in, []byte{b}) {
+		if bytes.IndexByte(in, b) != -1 {
 			in = bytes.Replace(in, esc, []byte{b}, -1)
 		}
 	}
@@ -1053,6 +1070,10 @@ func escapeStringField(in string) string {
 // unescapeStringField returns a copy of in with any escaped double-quotes
 // or backslashes unescaped
 func unescapeStringField(in string) string {
+	if strings.IndexByte(in, '\\') == -1 {
+		return in
+	}
+
 	var out []byte
 	i := 0
 	for {
@@ -1102,8 +1123,13 @@ func NewPoint(name string, tags Tags, fields Fields, time time.Time) (Point, err
 		}
 	}
 
+	key := MakeKey([]byte(name), tags)
+	if len(key) > MaxKeyLength {
+		return nil, fmt.Errorf("max key length exceeded: %v > %v", len(key), MaxKeyLength)
+	}
+
 	return &point{
-		key:    MakeKey([]byte(name), tags),
+		key:    key,
 		time:   time,
 		fields: fields.MarshalBinary(),
 	}, nil
@@ -1407,17 +1433,14 @@ func parseNumber(val []byte) (interface{}, error) {
 }
 
 func newFieldsFromBinary(buf []byte) Fields {
-	fields := Fields{}
+	fields := make(Fields, 8)
 	var (
 		i              int
 		name, valueBuf []byte
 		value          interface{}
 		err            error
 	)
-	for {
-		if i >= len(buf) {
-			break
-		}
+	for i < len(buf) {
 
 		i, name = scanTo(buf, i, '=')
 		name = escape.Unescape(name)

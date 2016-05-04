@@ -21,27 +21,16 @@ const (
 	stringCompressedSnappy = 1
 )
 
-type StringEncoder interface {
-	Write(s string)
-	Bytes() ([]byte, error)
-}
-
-type StringDecoder interface {
-	Next() bool
-	Read() string
-	Error() error
-}
-
-type stringEncoder struct {
+type StringEncoder struct {
 	// The encoded bytes
 	bytes []byte
 }
 
 func NewStringEncoder() StringEncoder {
-	return &stringEncoder{}
+	return StringEncoder{}
 }
 
-func (e *stringEncoder) Write(s string) {
+func (e *StringEncoder) Write(s string) {
 	b := make([]byte, 10)
 	// Append the length of the string using variable byte encoding
 	i := binary.PutUvarint(b, uint64(len(s)))
@@ -51,37 +40,44 @@ func (e *stringEncoder) Write(s string) {
 	e.bytes = append(e.bytes, s...)
 }
 
-func (e *stringEncoder) Bytes() ([]byte, error) {
+func (e *StringEncoder) Bytes() ([]byte, error) {
 	// Compress the currently appended bytes using snappy and prefix with
 	// a 1 byte header for future extension
 	data := snappy.Encode(nil, e.bytes)
 	return append([]byte{stringCompressedSnappy << 4}, data...), nil
 }
 
-type stringDecoder struct {
+type StringDecoder struct {
 	b   []byte
 	l   int
 	i   int
 	err error
 }
 
-func NewStringDecoder(b []byte) (StringDecoder, error) {
+// SetBytes initializes the decoder with bytes to read from.
+// This must be called before calling any other method.
+func (e *StringDecoder) SetBytes(b []byte) error {
 	// First byte stores the encoding type, only have snappy format
 	// currently so ignore for now.
 	data, err := snappy.Decode(nil, b[1:])
 	if err != nil {
-		return nil, fmt.Errorf("failed to decode string block: %v", err.Error())
+		return fmt.Errorf("failed to decode string block: %v", err.Error())
 	}
 
-	return &stringDecoder{b: data}, nil
+	e.b = data
+	e.l = 0
+	e.i = 0
+	e.err = nil
+
+	return nil
 }
 
-func (e *stringDecoder) Next() bool {
+func (e *StringDecoder) Next() bool {
 	e.i += e.l
 	return e.i < len(e.b)
 }
 
-func (e *stringDecoder) Read() string {
+func (e *StringDecoder) Read() string {
 	// Read the length of the string
 	length, n := binary.Uvarint(e.b[e.i:])
 
@@ -91,6 +87,6 @@ func (e *stringDecoder) Read() string {
 	return string(e.b[e.i+n : e.i+n+int(length)])
 }
 
-func (e *stringDecoder) Error() error {
+func (e *StringDecoder) Error() error {
 	return e.err
 }
