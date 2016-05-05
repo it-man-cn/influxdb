@@ -181,7 +181,7 @@ func (s *Service) backgroundLoop() {
 		case <-s.stop:
 			s.Logger.Println("continuous query service terminating")
 			return
-		case req := <-s.RunCh:
+		case req := <-s.RunCh: //specified continuous query
 			if !s.hasContinuousQueries() {
 				continue
 			}
@@ -189,7 +189,7 @@ func (s *Service) backgroundLoop() {
 				s.Logger.Printf("running continuous queries by request for time: %v", req.Now)
 				s.runContinuousQueries(req)
 			}
-		case <-time.After(s.RunInterval):
+		case <-time.After(s.RunInterval): //interval continuous query
 			if !s.hasContinuousQueries() {
 				continue
 			}
@@ -221,13 +221,16 @@ func (s *Service) runContinuousQueries(req *RunRequest) {
 	for _, db := range dbs {
 		// TODO: distribute across nodes
 		for _, cq := range db.ContinuousQueries {
-			if !req.matches(&cq) {
+			s.Logger.Printf("continuous query %s ", cq.Info.Name)
+			if !req.matches(&cq) { //req.CQs is nil ,all CQ will be run
+				s.Logger.Printf("continuous query %s doesn't match", cq.Info.Name)
 				continue
 			}
 			if err := s.ExecuteContinuousQuery(&db, &cq, req.Now); err != nil {
 				s.Logger.Printf("error executing query: %s: err = %s", cq.Query, err)
 				s.statMap.Add(statQueryFail, 1)
 			} else {
+				s.Logger.Printf("success executing query: %s", cq.Query)
 				s.statMap.Add(statQueryOK, 1)
 			}
 		}
@@ -258,6 +261,7 @@ func (s *Service) ExecuteContinuousQuery(dbi *meta.DatabaseInfo, cqi *meta.Conti
 
 	// See if this query needs to be run.
 	run, nextRun, err := cq.shouldRunContinuousQuery(now)
+	s.Logger.Printf("shouldRunContinuousQuery query: %s,run=%v,nextRun=%v,err=%s", cq.Query, run, nextRun, err)
 	if err != nil {
 		return err
 	} else if !run {
@@ -266,6 +270,7 @@ func (s *Service) ExecuteContinuousQuery(dbi *meta.DatabaseInfo, cqi *meta.Conti
 
 	// Get the group by interval.
 	interval, err := cq.q.GroupByInterval()
+	s.Logger.Printf("GroupByInterval query: %s,interval=%v,err=%s", cq.Query, interval, err)
 	if err != nil {
 		return err
 	} else if interval == 0 {
