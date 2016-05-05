@@ -221,9 +221,9 @@ func (s *Service) runContinuousQueries(req *RunRequest) {
 	for _, db := range dbs {
 		// TODO: distribute across nodes
 		for _, cq := range db.ContinuousQueries {
-			s.Logger.Printf("continuous query %s ", cq.Info.Name)
+			s.Logger.Printf("continuous query %s ", cq.Name)
 			if !req.matches(&cq) { //req.CQs is nil ,all CQ will be run
-				s.Logger.Printf("continuous query %s doesn't match", cq.Info.Name)
+				s.Logger.Printf("continuous query %s doesn't match", cq.Name)
 				continue
 			}
 			if err := s.ExecuteContinuousQuery(&db, &cq, req.Now); err != nil {
@@ -261,7 +261,7 @@ func (s *Service) ExecuteContinuousQuery(dbi *meta.DatabaseInfo, cqi *meta.Conti
 
 	// See if this query needs to be run.
 	run, nextRun, err := cq.shouldRunContinuousQuery(now)
-	s.Logger.Printf("shouldRunContinuousQuery query: %s,run=%v,nextRun=%v,err=%s", cq.Query, run, nextRun, err)
+	s.Logger.Printf("shouldRunContinuousQuery query: %s,run=%v,nextRun=%v,err=%s", cq.Info.Name, run, nextRun, err)
 	if err != nil {
 		return err
 	} else if !run {
@@ -270,7 +270,7 @@ func (s *Service) ExecuteContinuousQuery(dbi *meta.DatabaseInfo, cqi *meta.Conti
 
 	// Get the group by interval.
 	interval, err := cq.q.GroupByInterval()
-	s.Logger.Printf("GroupByInterval query: %s,interval=%v,err=%s", cq.Query, interval, err)
+	s.Logger.Printf("GroupByInterval query: %s,interval=%v,err=%s", cq.Info.Name, interval, err)
 	if err != nil {
 		return err
 	} else if interval == 0 {
